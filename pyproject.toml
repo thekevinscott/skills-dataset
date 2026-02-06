@@ -4,11 +4,12 @@ version = "0.1.0"
 description = "Build validated SKILL.md dataset for Kaggle"
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk>=0.1.0",
+    "anthropic>=0.40.0",
     "polars>=1.0.0",
     "pyarrow>=15.0.0",
     "pyyaml>=6.0.0",
     "click>=8.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]

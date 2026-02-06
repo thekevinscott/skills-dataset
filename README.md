@@ -4,7 +4,7 @@ Build a SKILL.md dataset from GitHub for Kaggle upload.
 
 ## Prerequisites
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (the `filter-valid-skills` command uses the Claude Agent SDK)
+- An Anthropic API key (`ANTHROPIC_API_KEY` env var) for the `filter-valid-skills` command
 - A GitHub token in `.env` (`GITHUB_TOKEN=...`)
 
 ## Installation

@@ -5,7 +5,7 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
-from claude_agent_sdk import query, ClaudeAgentOptions
+import anthropic
 
 # Validation prompt based on Claude Code skill documentation
 VALIDATION_PROMPT = """Analyze this SKILL.md file from GitHub.
@@ -89,6 +89,15 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
     return content_dir / owner / repo / "blob" / ref / path
 
 
+_client = None
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = anthropic.AsyncAnthropic()
+    return _client
+
+
 async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> dict:
     """Validate single file using Claude. Results are cached transparently."""
     cache_key = prompt_hash(content)
@@ -97,15 +106,15 @@ async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> d
         return cached
 
     prompt = VALIDATION_PROMPT.format(content=content)
-    options = ClaudeAgentOptions(permission_mode='bypassPermissions', model=model, max_turns=1)
 
-    result_text = ""
     try:
-        async for message in query(prompt=prompt, options=options):
-            if hasattr(message, 'content'):
-                for block in message.content:
-                    if hasattr(block, 'text'):
-                        result_text += block.text
+        message = await _get_client().messages.create(
+            model=model,
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        result_text = message.content[0].text if message.content else ""
 
         if not result_text.strip():
             raise ValueError("Claude returned empty response")
