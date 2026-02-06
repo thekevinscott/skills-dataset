@@ -1,6 +1,11 @@
 # GitHub Skills Dataset
 
-Build a validated SKILL.md dataset for Kaggle upload.
+Build a SKILL.md dataset from GitHub for Kaggle upload.
+
+## Prerequisites
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (the `filter-valid-skills` command uses the Claude Agent SDK)
+- A GitHub token in `.env` (`GITHUB_TOKEN=...`)
 
 ## Installation
 
@@ -8,85 +13,73 @@ Build a validated SKILL.md dataset for Kaggle upload.
 uv sync
 ```
 
-## Usage
+## Pipeline
 
-### 1. Collect data
+### 1. Fetch file paths
 
 ```bash
-# Use github-data-file-fetcher to collect files
-uvx github-data-file-fetcher fetch-file-paths "filename:SKILL.md"
-uvx github-data-file-fetcher fetch-file-content
-uvx github-data-file-fetcher fetch-repo-metadata
-uvx github-data-file-fetcher fetch-file-history
+uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
+  github-fetch fetch-file-paths "filename:SKILL.md" --db skills.db
 ```
 
-### 2. Validate files
+### 2. Fetch file content
 
 ```bash
-# Run validation (uses Claude SDK)
-uv run skills-dataset validate
+uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
+  github-fetch fetch-file-content --db skills.db --content-dir content
 ```
 
-Options:
-- `--main-db PATH` - Main database from github-data-file-fetcher (default: results/skills_v3.db)
-- `--validation-db PATH` - Validation results database (default: validation.db)
-- `--content-dir PATH` - Content directory (default: results/content)
-- `--batch-size INT` - Files per batch (default: 10)
-- `--max-concurrent INT` - Max concurrent API calls (default: 3)
+### 3. Filter valid skills
 
-### 3. Export to Parquet
+Uses Claude to classify each file. Produces a filtered DB with only valid skills.
 
 ```bash
-# Generate Parquet files for Kaggle
-uv run skills-dataset export --kaggle-username yourname
+uv run skills-dataset filter-valid-skills \
+  --main-db skills.db \
+  --output-db validated.db \
+  --content-dir content
 ```
 
-Options:
-- `--main-db PATH` - Main database from github-data-file-fetcher
-- `--validation-db PATH` - Validation results database
-- `--output-dir PATH` - Output directory (default: build/)
-- `--kaggle-username TEXT` - Kaggle username for metadata generation
+Options: `--batch-size`, `--max-concurrent`, `--model`
 
-### 4. Upload to Kaggle
+### 4. Fetch metadata and history
+
+Run against the filtered DB so we only fetch data for valid skills.
 
 ```bash
-cd build
-kaggle datasets create -p .
+uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
+  github-fetch fetch-repo-metadata --db validated.db
+
+uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
+  github-fetch fetch-file-history --db validated.db
+```
+
+### 5. Export to Parquet
+
+```bash
+uv run skills-dataset export --db validated.db --kaggle-username yourname
+```
+
+### 6. Upload to Kaggle
+
+```bash
+cd build && kaggle datasets create -p . --dir-mode tar
 ```
 
 ## Project Structure
 
 ```
-skills-dataset/                    # Git repo
-  ├── src/
-  │   └── github_skills_dataset/   # Python package
-  │       ├── __init__.py
-  │       ├── cli.py               # Click CLI
-  │       ├── validate.py          # Validation logic
-  │       ├── export.py            # Export logic
-  │       └── kaggle_metadata.py   # Metadata generation
-  ├── pyproject.toml
-  ├── README.md
-  ├── .gitignore
-  ├── validation.db                # Generated (gitignored)
-  ├── results/                     # From github-data-file-fetcher (gitignored)
-  └── build/                       # Export output (gitignored)
-      ├── files.parquet            # Dataset files
-      ├── repos.parquet
-      ├── history.parquet
-      ├── dataset-metadata.json
-      ├── README.md
-      └── scripts/                 # Reproducibility
-          ├── src/github_skills_dataset/
-          ├── pyproject.toml
-          └── README.md
+skills-dataset/
+  src/github_skills_dataset/
+    cli.py               # Click CLI
+    filter.py            # Two-pass validation (frontmatter + Claude)
+    export.py            # Parquet export
+    kaggle_metadata.py   # Kaggle dataset-metadata.json generation
+  pyproject.toml
+  README.md
+  build/                 # Export output (gitignored)
+    files.parquet
+    repos.parquet
+    history.parquet
+    scripts/             # Source code for reproducibility
 ```
-
-## Output
-
-The `build/` directory contains:
-- **Data files**: files.parquet, repos.parquet, history.parquet
-- **Metadata**: dataset-metadata.json, README.md
-- **Scripts**: Complete source code for reproducibility
-
-Upload the entire `build/` directory to Kaggle.

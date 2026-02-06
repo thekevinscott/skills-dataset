@@ -1,4 +1,4 @@
-"""Validate SKILL.md files using Claude."""
+"""Filter valid SKILL.md files using Claude."""
 
 import asyncio
 import hashlib
@@ -38,12 +38,10 @@ def has_valid_frontmatter(content: str) -> bool:
     if not content.startswith('---'):
         return False
 
-    # Find closing ---
     parts = content.split('---', 2)
     if len(parts) < 3:
         return False
 
-    # Try to parse YAML
     try:
         import yaml
         yaml.safe_load(parts[1])
@@ -53,21 +51,7 @@ def has_valid_frontmatter(content: str) -> bool:
 
 CACHE_DIR = Path.home() / ".cache/skills-dataset/claude"
 
-
-def init_validation_db(db_path: Path):
-    """Create validation database."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS validation_results (
-            url TEXT PRIMARY KEY,
-            is_skill BOOLEAN NOT NULL,
-            reason TEXT,
-            validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 
 def prompt_hash(content: str) -> str:
@@ -89,37 +73,9 @@ def insert_cached_result(content_hash: str, is_skill: bool, reason: str):
     cache_file = CACHE_DIR / f"{content_hash}.json"
     cache_file.write_text(json.dumps({"is_skill": is_skill, "reason": reason}))
 
-def get_all_file_urls(main_db: Path) -> list[str]:
-    """Get all URLs from github-data-file-fetcher database."""
-    conn = sqlite3.connect(main_db)
-    cursor = conn.execute("SELECT url FROM files")
-    urls = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return urls
-
-def get_validated_urls(validation_db: Path) -> set[str]:
-    """Get already validated URLs."""
-    if not validation_db.exists():
-        return set()
-    conn = sqlite3.connect(validation_db)
-    cursor = conn.execute("SELECT url FROM validation_results")
-    urls = {row[0] for row in cursor.fetchall()}
-    conn.close()
-    return urls
-
-def insert_validation_result(validation_db: Path, url: str, is_skill: bool, reason: str):
-    """Insert validation result."""
-    conn = sqlite3.connect(validation_db)
-    conn.execute(
-        "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
-        (url, is_skill, reason)
-    )
-    conn.commit()
-    conn.close()
 
 def parse_github_url(url: str) -> tuple[str, str, str, str] | None:
     """Parse GitHub URL into (owner, repo, ref, path)."""
-    # https://github.com/owner/repo/blob/ref/path
     parts = url.split('/')
     if len(parts) < 8 or parts[2] != 'github.com' or parts[5] != 'blob':
         return None
@@ -127,16 +83,14 @@ def parse_github_url(url: str) -> tuple[str, str, str, str] | None:
     path = '/'.join(parts[7:])
     return owner, repo, ref, path
 
+
 def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, path: str) -> Path:
     """Build path to local content file."""
     return content_dir / owner / repo / "blob" / ref / path
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-
 
 async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> dict:
     """Validate single file using Claude. Results are cached transparently."""
-    # Check cache
     cache_key = prompt_hash(content)
     cached = get_cached_result(cache_key)
     if cached is not None:
@@ -156,7 +110,6 @@ async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> d
         if not result_text.strip():
             raise ValueError("Claude returned empty response")
 
-        # Parse JSON response
         import re
         try:
             result = json.loads(result_text)
@@ -171,12 +124,12 @@ async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> d
                 else:
                     raise ValueError(f"Could not parse JSON from response: {result_text[:200]}")
 
-        # Cache the result
         insert_cached_result(cache_key, result.get("is_skill", False), result.get("reason", ""))
         return result
 
     except Exception as e:
         raise RuntimeError(f"Claude API error for {url}: {str(e)}") from e
+
 
 async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.Semaphore, model: str = DEFAULT_MODEL) -> list[dict]:
     """Process batch of URLs with concurrency limit."""
@@ -195,11 +148,9 @@ async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.S
 
                 content = local_path.read_text(errors='replace')
 
-                # First pass: Check for valid frontmatter (cheap)
                 if not has_valid_frontmatter(content):
                     return {"url": url, "is_skill": False, "reason": "No valid YAML frontmatter"}
 
-                # Second pass: Ask Claude (expensive)
                 result = await validate_file(url, content, model=model)
                 result["url"] = url
                 return result
@@ -210,47 +161,104 @@ async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.S
     tasks = [process_one(url) for url in urls]
     return await asyncio.gather(*tasks)
 
+
+def init_output_db(output_db: Path):
+    """Create the output database with validation_results and files tables."""
+    conn = sqlite3.connect(output_db)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS validation_results (
+            url TEXT PRIMARY KEY,
+            is_skill BOOLEAN NOT NULL,
+            reason TEXT,
+            validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            url TEXT PRIMARY KEY,
+            sha TEXT,
+            size_bytes INTEGER,
+            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def rebuild_files_table(main_db: Path, output_db: Path):
+    """Copy valid file rows from main DB into output DB's files table."""
+    out = sqlite3.connect(output_db)
+    out.execute("DELETE FROM files")
+
+    main = sqlite3.connect(main_db)
+    valid_urls = {row[0] for row in out.execute(
+        "SELECT url FROM validation_results WHERE is_skill = 1"
+    ).fetchall()}
+
+    rows = main.execute("SELECT url, sha, size_bytes, discovered_at FROM files").fetchall()
+    inserted = 0
+    for row in rows:
+        if row[0] in valid_urls:
+            out.execute("INSERT OR IGNORE INTO files VALUES (?,?,?,?)", row)
+            inserted += 1
+
+    out.commit()
+    main.close()
+    out.close()
+    return inserted
+
+
 async def main(args):
-    """Main validation pipeline."""
+    """Main filter pipeline: validate files, produce filtered DB."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    init_output_db(args.output_db)
 
-    # Initialize validation database
-    init_validation_db(args.validation_db)
+    # Get all URLs from source DB
+    main_conn = sqlite3.connect(args.main_db)
+    all_urls = [row[0] for row in main_conn.execute("SELECT url FROM files").fetchall()]
+    main_conn.close()
 
-    # Get files to validate
-    all_urls = get_all_file_urls(args.main_db)
-    validated_urls = get_validated_urls(args.validation_db)
+    # Check what's already validated in output DB
+    out_conn = sqlite3.connect(args.output_db)
+    validated_urls = {row[0] for row in out_conn.execute("SELECT url FROM validation_results").fetchall()}
+    out_conn.close()
+
     to_validate = [url for url in all_urls if url not in validated_urls]
 
     print(f"Total: {len(all_urls):,}, Already validated: {len(validated_urls):,}, To validate: {len(to_validate):,}")
 
-    if not to_validate:
-        print("Nothing to validate!")
-        return
+    if to_validate:
+        semaphore = asyncio.Semaphore(args.max_concurrent)
+        stats = {"validated": 0, "is_skill": 0, "not_skill": 0}
 
-    # Process in batches
-    semaphore = asyncio.Semaphore(args.max_concurrent)
-    stats = {"validated": 0, "is_skill": 0, "not_skill": 0}
+        for i in range(0, len(to_validate), args.batch_size):
+            batch = to_validate[i:i + args.batch_size]
+            print(f"\nBatch {i // args.batch_size + 1} ({len(batch)} files):")
 
-    for i in range(0, len(to_validate), args.batch_size):
-        batch = to_validate[i:i + args.batch_size]
-        print(f"\nBatch {i // args.batch_size + 1} ({len(batch)} files):")
+            results = await process_batch(batch, args.content_dir, semaphore, model=args.model or DEFAULT_MODEL)
 
-        results = await process_batch(batch, args.content_dir, semaphore, model=getattr(args, 'model', None) or DEFAULT_MODEL)
+            out_conn = sqlite3.connect(args.output_db)
+            for result in results:
+                url = result["url"]
+                is_skill = result.get("is_skill", False)
+                reason = result.get("reason", "")
 
-        # Save results
-        for result in results:
-            url = result["url"]
-            is_skill = result.get("is_skill", False)
-            reason = result.get("reason", "")
+                out_conn.execute(
+                    "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
+                    (url, is_skill, reason)
+                )
 
-            insert_validation_result(args.validation_db, url, is_skill, reason)
+                stats["validated"] += 1
+                if is_skill:
+                    stats["is_skill"] += 1
+                    print(f"  + {url[:80]}")
+                else:
+                    stats["not_skill"] += 1
+                    print(f"  - {url[:80]} -- {reason[:40]}")
 
-            stats["validated"] += 1
-            if is_skill:
-                stats["is_skill"] += 1
-                print(f"  ✓ {url[:80]}")
-            else:
-                stats["not_skill"] += 1
-                print(f"  ✗ {url[:80]} - {reason[:40]}")
+            out_conn.commit()
+            out_conn.close()
 
-    print(f"\n✅ Done: {stats['validated']} validated, {stats['is_skill']} valid skills, {stats['not_skill']} false positives")
+        print(f"\nValidated: {stats['validated']}, valid: {stats['is_skill']}, rejected: {stats['not_skill']}")
+
+    # Rebuild files table with valid URLs
+    valid_count = rebuild_files_table(args.main_db, args.output_db)
+    print(f"\nOutput DB: {args.output_db} ({valid_count:,} valid skill files)")
