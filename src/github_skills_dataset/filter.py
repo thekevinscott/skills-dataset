@@ -225,14 +225,15 @@ async def main(args):
             local_results.append((url, False, "No valid YAML frontmatter"))
             continue
 
-        truncated = truncate_content(content)
-        cache_key = prompt_hash(truncated)
+        cache_key = prompt_hash(content)
         cached = get_cached_result(cache_key)
 
         if cached is not None:
             stats["cached"] += 1
             local_results.append((url, cached["is_skill"], cached.get("reason", "")))
             continue
+
+        truncated = truncate_content(content)
 
         # Deduplicate by content -- same content across repos only needs one API call
         if cache_key in uncached:
