@@ -39,7 +39,12 @@ def cli():
     default=None,
     help="Claude model to use (default: claude-haiku-4-5-20251001)",
 )
-def filter_valid_skills(main_db, output_db, content_dir, model):
+@click.option(
+    "--base-url",
+    default=None,
+    help="Base URL for API proxy (e.g. http://localhost:11434/v1)",
+)
+def filter_valid_skills(main_db, output_db, content_dir, model, base_url):
     """Filter SKILL.md files using Claude Message Batches API (50% discount)."""
     from .filter import filter
 
@@ -51,6 +56,7 @@ def filter_valid_skills(main_db, output_db, content_dir, model):
     args.output_db = output_db
     args.content_dir = content_dir
     args.model = model
+    args.base_url = base_url
 
     asyncio.run(filter(args))
 

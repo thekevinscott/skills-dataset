@@ -1,4 +1,4 @@
-"""Filter valid SKILL.md files using Claude via the Message Batches API (50% discount)."""
+"""Filter valid SKILL.md files using an LLM API."""
 
 import asyncio
 import json
@@ -8,7 +8,9 @@ import sqlite3
 from pathlib import Path
 
 import anthropic
-from .config import CACHE_DIR, DEFAULT_MODEL, BATCH_CHUNK_SIZE, VALIDATION_PROMPT
+from .config import CACHE_DIR, DEFAULT_MODEL, VALIDATION_PROMPT
+
+MAX_CONCURRENT = 10
 from .parse_github_url import parse_github_url
 from .has_valid_frontmatter import has_valid_frontmatter
 from .prompt_hash import prompt_hash
@@ -169,82 +171,68 @@ async def filter(args):
         print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
         return
 
-    # --- Phase 2: Submit to Batches API ---
-    try:
-        client = anthropic.AsyncAnthropic()
-        unique_items = list(uncached.items())  # [(cache_key, (content, [urls]))]
+    # --- Phase 2: Concurrent API calls ---
+    base_url = getattr(args, 'base_url', None)
+    client_kwargs = {}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+        client_kwargs["api_key"] = "not-needed"
+    client = anthropic.AsyncAnthropic(**client_kwargs)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-        for chunk_start in range(0, len(unique_items), BATCH_CHUNK_SIZE):
-            chunk = unique_items[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
+    async def validate_one(cache_key, content):
+        async with semaphore:
+            prompt = VALIDATION_PROMPT.format(content=content)
+            message = await client.messages.create(
+                model=model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = message.content[0].text
+            return parse_response(text)
 
-            requests = []
-            for cache_key, (content, _urls) in chunk:
-                requests.append({
-                    "custom_id": cache_key,
-                    "params": {
-                        "model": model,
-                        "max_tokens": 256,
-                        "messages": [{"role": "user", "content": VALIDATION_PROMPT.format(content=content)}],
-                    }
-                })
+    unique_items = list(uncached.items())
+    out_conn = sqlite3.connect(args.output_db)
+    valid_count = 0
+    invalid_count = 0
+    error_count = 0
 
-            batch = await client.messages.batches.create(requests=requests)
-            print(f"\nSubmitted batch {batch.id} ({len(requests):,} requests)")
+    # Process in chunks to write results incrementally
+    chunk_size = 100
+    for chunk_start in range(0, len(unique_items), chunk_size):
+        chunk = unique_items[chunk_start:chunk_start + chunk_size]
+        print(f"\nChunk {chunk_start // chunk_size + 1} ({len(chunk)} unique files):")
 
-            # Poll for completion
-            while batch.processing_status != "ended":
-                await asyncio.sleep(30)
-                batch = await client.messages.batches.retrieve(batch.id)
-                done = (batch.request_counts.succeeded
-                        + batch.request_counts.errored
-                        + batch.request_counts.expired)
-                print(f"  Progress: {done:,}/{len(requests):,} "
-                      f"(succeeded: {batch.request_counts.succeeded:,}, "
-                      f"errored: {batch.request_counts.errored:,})")
+        tasks = {cache_key: asyncio.create_task(validate_one(cache_key, content))
+                 for cache_key, (content, _urls) in chunk}
 
-            # --- Phase 3: Process results ---
-            out_conn = sqlite3.connect(args.output_db)
-            valid_count = 0
-            invalid_count = 0
-            error_count = 0
+        for cache_key, task in tasks.items():
+            _, urls = uncached[cache_key]
+            try:
+                result = await task
+                is_skill = result.get("is_skill", False)
+                reason = result.get("reason", "")
+            except Exception as e:
+                is_skill = False
+                reason = f"Error: {str(e)[:80]}"
+                error_count += 1
 
-            result_stream = await client.messages.batches.results(batch.id)
-            async for result in result_stream:
-                cache_key = result.custom_id
-                _, urls = uncached[cache_key]
+            insert_cached_result(cache_key, is_skill, reason)
 
-                if result.result.type == "succeeded":
-                    try:
-                        text = result.result.message.content[0].text
-                        parsed = parse_response(text)
-                        is_skill = parsed.get("is_skill", False)
-                        reason = parsed.get("reason", "")
-                    except Exception as e:
-                        is_skill = False
-                        reason = f"Parse error: {str(e)[:50]}"
-                        error_count += 1
+            for url in urls:
+                out_conn.execute(
+                    "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
+                    (url, is_skill, reason)
+                )
+                if is_skill:
+                    valid_count += 1
                 else:
-                    is_skill = False
-                    reason = f"API error: {result.result.type}"
-                    error_count += 1
+                    invalid_count += 1
 
-                insert_cached_result(cache_key, is_skill, reason)
+        out_conn.commit()
+        print(f"  valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
 
-                for url in urls:
-                    out_conn.execute(
-                        "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
-                        (url, is_skill, reason)
-                    )
-                    if is_skill:
-                        valid_count += 1
-                    else:
-                        invalid_count += 1
-
-            out_conn.commit()
-            out_conn.close()
-            print(f"  Results: {valid_count:,} valid, {invalid_count:,} rejected, {error_count:,} errors")
-    except Exception as e:
-        print(f"\nBatch API error: {e}")
+    out_conn.close()
 
     # --- Phase 4: Rebuild files table (always runs) ---
     final_valid = rebuild_files_table(args.main_db, args.output_db)
