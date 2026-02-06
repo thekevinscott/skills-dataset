@@ -1,6 +1,7 @@
 """Validate SKILL.md files using Claude."""
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -50,6 +51,9 @@ def has_valid_frontmatter(content: str) -> bool:
     except:
         return False
 
+CACHE_DIR = Path.home() / ".cache/skills-dataset/claude"
+
+
 def init_validation_db(db_path: Path):
     """Create validation database."""
     conn = sqlite3.connect(db_path)
@@ -63,6 +67,27 @@ def init_validation_db(db_path: Path):
     """)
     conn.commit()
     conn.close()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def prompt_hash(content: str) -> str:
+    """Hash the full formatted prompt for cache keying."""
+    full_prompt = VALIDATION_PROMPT.format(content=content)
+    return hashlib.sha256(full_prompt.encode()).hexdigest()
+
+
+def get_cached_result(content_hash: str) -> dict | None:
+    """Check file cache for a previous Claude result."""
+    cache_file = CACHE_DIR / f"{content_hash}.json"
+    if cache_file.exists():
+        return json.loads(cache_file.read_text())
+    return None
+
+
+def insert_cached_result(content_hash: str, is_skill: bool, reason: str):
+    """Store Claude result in file cache."""
+    cache_file = CACHE_DIR / f"{content_hash}.json"
+    cache_file.write_text(json.dumps({"is_skill": is_skill, "reason": reason}))
 
 def get_all_file_urls(main_db: Path) -> list[str]:
     """Get all URLs from github-data-file-fetcher database."""
@@ -106,11 +131,19 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
     """Build path to local content file."""
     return content_dir / owner / repo / "blob" / ref / path
 
-async def validate_file(url: str, content: str) -> dict:
-    """Validate single file using Claude. Raises on API errors."""
-    prompt = VALIDATION_PROMPT.format(content=content)  # Full content, no truncation
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
-    options = ClaudeAgentOptions(permission_mode='bypassPermissions')
+
+async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> dict:
+    """Validate single file using Claude. Results are cached transparently."""
+    # Check cache
+    cache_key = prompt_hash(content)
+    cached = get_cached_result(cache_key)
+    if cached is not None:
+        return cached
+
+    prompt = VALIDATION_PROMPT.format(content=content)
+    options = ClaudeAgentOptions(permission_mode='bypassPermissions', model=model, max_turns=1)
 
     result_text = ""
     try:
@@ -120,27 +153,32 @@ async def validate_file(url: str, content: str) -> dict:
                     if hasattr(block, 'text'):
                         result_text += block.text
 
+        if not result_text.strip():
+            raise ValueError("Claude returned empty response")
+
         # Parse JSON response
         import re
-        # Try direct JSON parse first
         try:
-            return json.loads(result_text)
+            result = json.loads(result_text)
         except json.JSONDecodeError:
-            # Extract from markdown code block
             match = re.search(r'```json\s*(\{.*?\})\s*```', result_text, re.DOTALL)
             if match:
-                return json.loads(match.group(1))
-            # Try to find any JSON object
-            match = re.search(r'\{.*"is_skill".*\}', result_text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            raise ValueError(f"Could not parse JSON from response: {result_text[:200]}")
+                result = json.loads(match.group(1))
+            else:
+                match = re.search(r'\{.*"is_skill".*\}', result_text, re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                else:
+                    raise ValueError(f"Could not parse JSON from response: {result_text[:200]}")
+
+        # Cache the result
+        insert_cached_result(cache_key, result.get("is_skill", False), result.get("reason", ""))
+        return result
 
     except Exception as e:
-        # Raise on API errors - don't swallow them
         raise RuntimeError(f"Claude API error for {url}: {str(e)}") from e
 
-async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.Semaphore) -> list[dict]:
+async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.Semaphore, model: str = DEFAULT_MODEL) -> list[dict]:
     """Process batch of URLs with concurrency limit."""
     async def process_one(url: str):
         async with semaphore:
@@ -162,13 +200,10 @@ async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.S
                     return {"url": url, "is_skill": False, "reason": "No valid YAML frontmatter"}
 
                 # Second pass: Ask Claude (expensive)
-                result = await validate_file(url, content)
+                result = await validate_file(url, content, model=model)
                 result["url"] = url
                 return result
 
-            except RuntimeError:
-                # Re-raise API errors (don't catch them)
-                raise
             except Exception as e:
                 return {"url": url, "is_skill": False, "reason": f"Error: {str(e)}"}
 
@@ -200,7 +235,7 @@ async def main(args):
         batch = to_validate[i:i + args.batch_size]
         print(f"\nBatch {i // args.batch_size + 1} ({len(batch)} files):")
 
-        results = await process_batch(batch, args.content_dir, semaphore)
+        results = await process_batch(batch, args.content_dir, semaphore, model=getattr(args, 'model', None) or DEFAULT_MODEL)
 
         # Save results
         for result in results:

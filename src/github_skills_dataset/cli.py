@@ -43,7 +43,12 @@ def cli():
     default=3,
     help="Max concurrent API calls",
 )
-def validate(main_db, validation_db, content_dir, batch_size, max_concurrent):
+@click.option(
+    "--model",
+    default=None,
+    help="Claude model to use (default: claude-haiku-4-5-20251001)",
+)
+def validate(main_db, validation_db, content_dir, batch_size, max_concurrent, model):
     """Validate SKILL.md files using Claude."""
     from .validate import main as validate_main
 
@@ -57,6 +62,7 @@ def validate(main_db, validation_db, content_dir, batch_size, max_concurrent):
     args.content_dir = content_dir
     args.batch_size = batch_size
     args.max_concurrent = max_concurrent
+    args.model = model
 
     # Run the validation with our args
     asyncio.run(validate_main(args))

@@ -53,7 +53,7 @@ def export_repos(main_db: Path, files_df: pl.DataFrame, output_path: Path):
 
     # Parse topics JSON to list
     repos_df = repos_df.with_columns([
-        pl.col("topics").str.json_extract().alias("topics"),
+        pl.col("topics").str.json_decode(pl.List(pl.Utf8)).alias("topics"),
         pl.col("repo_key").str.split("/").list.get(0).alias("repo_owner"),
         pl.col("repo_key").str.split("/").list.get(1).alias("repo_name"),
     ])
@@ -76,8 +76,9 @@ def export_history(main_db: Path, files_df: pl.DataFrame, output_path: Path):
     history_df = file_urls.join(history_df, on="url", how="left")
 
     # Parse commits JSON and extract stats
+    commit_dtype = pl.List(pl.Struct({"sha": pl.Utf8, "author": pl.Utf8, "date": pl.Utf8, "message": pl.Utf8}))
     history_df = history_df.with_columns([
-        pl.col("commits").str.json_extract().alias("commits_array")
+        pl.col("commits").str.json_decode(commit_dtype).alias("commits_array")
     ]).with_columns([
         # First commit (oldest) is last in array
         pl.col("commits_array").list.get(-1).struct.field("date").alias("first_commit_date"),
