@@ -3,11 +3,39 @@
 import asyncio
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
 import anthropic
 
-# Validation prompt based on Claude Code skill documentation
+# System prompt (cached across all API calls)
+SYSTEM_PROMPT = """Analyze SKILL.md files from GitHub and classify them as valid or invalid.
+
+A valid Claude Code skill file has:
+1. YAML frontmatter between --- markers (at the start)
+2. Markdown content after frontmatter
+3. Content that extends Claude's capabilities (instructions, workflows, knowledge, or commands)
+
+Common frontmatter fields (all optional):
+- name, description, disable-model-invocation, user-invocable, allowed-tools
+
+The content can be:
+- Reference material (API conventions, patterns, style guides)
+- Task instructions (step-by-step workflows like deploy, commit)
+- Templates or examples
+- Configuration for tools/agents
+
+Be INCLUSIVE - if it has frontmatter + markdown content that looks skill-like, mark as valid.
+Reject only if clearly not a skill (blog posts, GitHub templates, unrelated docs).
+
+Respond with JSON only:
+{"is_skill": true/false, "reason": "one sentence"}"""
+
+# Per-file user prompt (only the file content varies)
+USER_PROMPT = """File content:
+{content}"""
+
+# Legacy combined prompt kept for cache key compatibility only
 VALIDATION_PROMPT = """Analyze this SKILL.md file from GitHub.
 
 A valid Claude Code skill file has:
@@ -53,6 +81,11 @@ CACHE_DIR = Path.home() / ".cache/skills-dataset/claude"
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
+# Batching: pack multiple files into one API call to reduce overhead
+BATCH_TOKEN_BUDGET = 30_000  # Max estimated content tokens per API call
+BATCH_MAX_FILES = 20         # Cap for reliable JSON array parsing
+BYTES_PER_TOKEN = 4          # Rough bytes-to-tokens ratio
+
 
 def prompt_hash(content: str) -> str:
     """Hash the full formatted prompt for cache keying."""
@@ -72,6 +105,69 @@ def insert_cached_result(content_hash: str, is_skill: bool, reason: str):
     """Store Claude result in file cache."""
     cache_file = CACHE_DIR / f"{content_hash}.json"
     cache_file.write_text(json.dumps({"is_skill": is_skill, "reason": reason}))
+
+
+BATCH_SYSTEM_PROMPT = """Analyze each numbered SKILL.md file and classify as valid or invalid.
+
+A valid Claude Code skill file has:
+1. YAML frontmatter between --- markers (at the start)
+2. Markdown content after frontmatter
+3. Content that extends Claude's capabilities (instructions, workflows, knowledge, or commands)
+
+Common frontmatter fields (all optional):
+- name, description, disable-model-invocation, user-invocable, allowed-tools
+
+The content can be:
+- Reference material (API conventions, patterns, style guides)
+- Task instructions (step-by-step workflows like deploy, commit)
+- Templates or examples
+- Configuration for tools/agents
+
+Be INCLUSIVE - if it has frontmatter + markdown content that looks skill-like, mark as valid.
+Reject only if clearly not a skill (blog posts, GitHub templates, unrelated docs).
+
+Respond with a JSON array only, one object per file in input order:
+[{"file": 1, "is_skill": true, "reason": "one sentence"}, ...]"""
+
+
+def make_batch_user_prompt(file_contents: list[tuple[str, str]]) -> str:
+    """Format multiple files into a single user prompt."""
+    parts = []
+    for i, (_url, content) in enumerate(file_contents, 1):
+        parts.append(f"=== File {i} ===\n{content}")
+    return f"Classify these {len(file_contents)} files:\n\n" + "\n\n".join(parts)
+
+
+def pack_batches(items: list[tuple[str, str, int]]) -> list[list[tuple[str, str]]]:
+    """Pack (url, content, size_bytes) into batches respecting token budget and file count."""
+    batches = []
+    current_batch = []
+    current_tokens = 0
+
+    for url, content, size_bytes in items:
+        estimated_tokens = size_bytes // BYTES_PER_TOKEN
+
+        # Single file exceeds budget -- send it alone
+        if estimated_tokens > BATCH_TOKEN_BUDGET:
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            batches.append([(url, content)])
+            continue
+
+        if current_tokens + estimated_tokens > BATCH_TOKEN_BUDGET or len(current_batch) >= BATCH_MAX_FILES:
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = 0
+
+        current_batch.append((url, content))
+        current_tokens += estimated_tokens
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
 
 
 def parse_github_url(url: str) -> tuple[str, str, str, str] | None:
@@ -119,7 +215,6 @@ async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> d
         if not result_text.strip():
             raise ValueError("Claude returned empty response")
 
-        import re
         try:
             result = json.loads(result_text)
         except json.JSONDecodeError:
@@ -140,31 +235,131 @@ async def validate_file(url: str, content: str, model: str = DEFAULT_MODEL) -> d
         raise RuntimeError(f"Claude API error for {url}: {str(e)}") from e
 
 
-async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.Semaphore, model: str = DEFAULT_MODEL) -> list[dict]:
-    """Process batch of URLs with concurrency limit."""
-    async def process_one(url: str):
-        async with semaphore:
+async def validate_batch_files(file_contents: list[tuple[str, str]], model: str = DEFAULT_MODEL) -> list[dict]:
+    """Validate multiple files in a single API call. Checks/populates per-file cache."""
+    results = [None] * len(file_contents)
+    uncached = []  # (original_index, url, content)
+
+    for i, (url, content) in enumerate(file_contents):
+        cache_key = prompt_hash(content)
+        cached = get_cached_result(cache_key)
+        if cached is not None:
+            cached["url"] = url
+            results[i] = cached
+        else:
+            uncached.append((i, url, content))
+
+    if not uncached:
+        return results
+
+    # Single uncached file -- use existing single-file path
+    if len(uncached) == 1:
+        idx, url, content = uncached[0]
+        result = await validate_file(url, content, model=model)
+        result["url"] = url
+        results[idx] = result
+        return results
+
+    # Build batch prompt for uncached files
+    batch_contents = [(url, content) for _, url, content in uncached]
+    prompt = make_batch_user_prompt(batch_contents)
+
+    try:
+        message = await _get_client().messages.create(
+            model=model,
+            max_tokens=max(256, 64 * len(uncached)),
+            system=BATCH_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        result_text = message.content[0].text if message.content else ""
+        if not result_text.strip():
+            raise ValueError("Claude returned empty response")
+
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError:
+            match = re.search(r'```json\s*(\[.*?\])\s*```', result_text, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(1))
+            else:
+                match = re.search(r'\[.*\]', result_text, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(0))
+                else:
+                    raise ValueError(f"Could not parse JSON array: {result_text[:200]}")
+
+        if not isinstance(parsed, list) or len(parsed) != len(uncached):
+            raise ValueError(
+                f"Expected {len(uncached)} results, got "
+                f"{len(parsed) if isinstance(parsed, list) else 'non-list'}"
+            )
+
+        for j, (idx, url, content) in enumerate(uncached):
+            file_result = parsed[j]
+            is_skill = file_result.get("is_skill", False)
+            reason = file_result.get("reason", "")
+            cache_key = prompt_hash(content)
+            insert_cached_result(cache_key, is_skill, reason)
+            results[idx] = {"url": url, "is_skill": is_skill, "reason": reason}
+
+        return results
+
+    except Exception as e:
+        # Batch failed -- fall back to individual validation
+        print(f"  Batch API call failed ({e}), falling back to individual calls")
+        for idx, url, content in uncached:
             try:
-                parsed = parse_github_url(url)
-                if not parsed:
-                    return {"url": url, "is_skill": False, "reason": "Invalid URL format"}
-
-                owner, repo, ref, path = parsed
-                local_path = resolve_content_path(content_dir, owner, repo, ref, path)
-                content = local_path.read_text(errors='replace')
-
-                if not has_valid_frontmatter(content):
-                    return {"url": url, "is_skill": False, "reason": "No valid YAML frontmatter"}
-
                 result = await validate_file(url, content, model=model)
                 result["url"] = url
-                return result
+                results[idx] = result
+            except Exception as inner_e:
+                results[idx] = {"url": url, "is_skill": False, "reason": f"Error: {str(inner_e)}"}
+        return results
 
-            except Exception as e:
-                return {"url": url, "is_skill": False, "reason": f"Error: {str(e)}"}
 
-    tasks = [process_one(url) for url in urls]
-    return await asyncio.gather(*tasks)
+async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.Semaphore, model: str = DEFAULT_MODEL) -> list[dict]:
+    """Process URLs: filter by frontmatter locally, then batch API calls."""
+    items = []   # (url, content, size_bytes) for files needing API validation
+    results = [] # immediate results for locally-rejected files
+
+    for url in urls:
+        parsed = parse_github_url(url)
+        if not parsed:
+            results.append({"url": url, "is_skill": False, "reason": "Invalid URL format"})
+            continue
+
+        owner, repo, ref, path = parsed
+        local_path = resolve_content_path(content_dir, owner, repo, ref, path)
+        try:
+            content = local_path.read_text(errors='replace')
+        except Exception:
+            results.append({"url": url, "is_skill": False, "reason": "File read error"})
+            continue
+
+        if not has_valid_frontmatter(content):
+            results.append({"url": url, "is_skill": False, "reason": "No valid YAML frontmatter"})
+            continue
+
+        items.append((url, content, len(content.encode('utf-8'))))
+
+    if not items:
+        return results
+
+    # Pack into token-budget-sized API batches
+    api_batches = pack_batches(items)
+
+    async def call_batch(batch):
+        async with semaphore:
+            return await validate_batch_files(batch, model=model)
+
+    tasks = [call_batch(b) for b in api_batches]
+    batch_results = await asyncio.gather(*tasks)
+
+    for batch_result in batch_results:
+        results.extend(batch_result)
+
+    return results
 
 
 def init_output_db(output_db: Path):

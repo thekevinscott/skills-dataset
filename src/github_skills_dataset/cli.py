@@ -37,8 +37,8 @@ def cli():
 @click.option(
     "--batch-size",
     type=int,
-    default=10,
-    help="Files per batch",
+    default=100,
+    help="URLs per processing batch (files are packed into API calls automatically)",
 )
 @click.option(
     "--max-concurrent",
