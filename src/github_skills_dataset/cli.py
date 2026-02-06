@@ -35,24 +35,12 @@ def cli():
     help="Content directory from github-data-file-fetcher",
 )
 @click.option(
-    "--batch-size",
-    type=int,
-    default=100,
-    help="URLs per processing batch (files are packed into API calls automatically)",
-)
-@click.option(
-    "--max-concurrent",
-    type=int,
-    default=3,
-    help="Max concurrent API calls",
-)
-@click.option(
     "--model",
     default=None,
     help="Claude model to use (default: claude-haiku-4-5-20251001)",
 )
-def filter_valid_skills(main_db, output_db, content_dir, batch_size, max_concurrent, model):
-    """Filter SKILL.md files using Claude, producing a DB with only valid skills."""
+def filter_valid_skills(main_db, output_db, content_dir, model):
+    """Filter SKILL.md files using Claude Message Batches API (50% discount)."""
     from .filter import main as filter_main
 
     class Args:
@@ -62,8 +50,6 @@ def filter_valid_skills(main_db, output_db, content_dir, batch_size, max_concurr
     args.main_db = main_db
     args.output_db = output_db
     args.content_dir = content_dir
-    args.batch_size = batch_size
-    args.max_concurrent = max_concurrent
     args.model = model
 
     asyncio.run(filter_main(args))
