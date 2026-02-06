@@ -151,10 +151,6 @@ async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.S
 
                 owner, repo, ref, path = parsed
                 local_path = resolve_content_path(content_dir, owner, repo, ref, path)
-
-                if not local_path.exists():
-                    return None  # content not fetched yet; skip
-
                 content = local_path.read_text(errors='replace')
 
                 if not has_valid_frontmatter(content):
@@ -230,13 +226,26 @@ async def main(args):
     validated_urls = {row[0] for row in out_conn.execute("SELECT url FROM validation_results").fetchall()}
     out_conn.close()
 
-    to_validate = [url for url in all_urls if url not in validated_urls]
+    # Only include URLs that have content on disk and haven't been validated yet
+    to_validate = []
+    no_content = 0
+    for url in all_urls:
+        if url in validated_urls:
+            continue
+        parsed = parse_github_url(url)
+        if not parsed:
+            continue
+        owner, repo, ref, path = parsed
+        if resolve_content_path(args.content_dir, owner, repo, ref, path).exists():
+            to_validate.append(url)
+        else:
+            no_content += 1
 
-    print(f"Total: {len(all_urls):,}, Already validated: {len(validated_urls):,}, To validate: {len(to_validate):,}")
+    print(f"Total: {len(all_urls):,}, Already validated: {len(validated_urls):,}, Content available: {len(to_validate):,}, No content yet: {no_content:,}")
 
     if to_validate:
         semaphore = asyncio.Semaphore(args.max_concurrent)
-        stats = {"validated": 0, "is_skill": 0, "not_skill": 0, "skipped": 0}
+        stats = {"validated": 0, "is_skill": 0, "not_skill": 0}
 
         for i in range(0, len(to_validate), args.batch_size):
             batch = to_validate[i:i + args.batch_size]
@@ -246,10 +255,6 @@ async def main(args):
 
             out_conn = sqlite3.connect(args.output_db)
             for result in results:
-                if result is None:
-                    stats["skipped"] += 1
-                    continue
-
                 url = result["url"]
                 is_skill = result.get("is_skill", False)
                 reason = result.get("reason", "")
@@ -270,7 +275,7 @@ async def main(args):
             out_conn.commit()
             out_conn.close()
 
-        print(f"\nValidated: {stats['validated']}, valid: {stats['is_skill']}, rejected: {stats['not_skill']}, skipped (no content): {stats['skipped']}")
+        print(f"\nValidated: {stats['validated']}, valid: {stats['is_skill']}, rejected: {stats['not_skill']}")
 
     # Rebuild files table with valid URLs
     valid_count = rebuild_files_table(args.main_db, args.output_db)
