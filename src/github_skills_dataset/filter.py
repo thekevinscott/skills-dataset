@@ -226,6 +226,13 @@ async def main(args):
     validated_urls = {row[0] for row in out_conn.execute("SELECT url FROM validation_results").fetchall()}
     out_conn.close()
 
+    # Build set of all content paths on disk (single os.walk, fast)
+    import os
+    content_paths = set()
+    for dirpath, _, filenames in os.walk(args.content_dir):
+        for fname in filenames:
+            content_paths.add(os.path.join(dirpath, fname))
+
     # Only include URLs that have content on disk and haven't been validated yet
     to_validate = []
     no_content = 0
@@ -236,7 +243,7 @@ async def main(args):
         if not parsed:
             continue
         owner, repo, ref, path = parsed
-        if resolve_content_path(args.content_dir, owner, repo, ref, path).exists():
+        if str(resolve_content_path(args.content_dir, owner, repo, ref, path)) in content_paths:
             to_validate.append(url)
         else:
             no_content += 1
