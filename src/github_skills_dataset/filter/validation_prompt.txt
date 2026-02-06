@@ -1,0 +1,24 @@
+Analyze this SKILL.md file from GitHub.
+
+A valid Claude Code skill file has:
+1. YAML frontmatter between --- markers (at the start)
+2. Markdown content after frontmatter
+3. Content that extends Claude's capabilities (instructions, workflows, knowledge, or commands)
+
+Common frontmatter fields (all optional):
+- name, description, disable-model-invocation, user-invocable, allowed-tools
+
+The content can be:
+- Reference material (API conventions, patterns, style guides)
+- Task instructions (step-by-step workflows like deploy, commit)
+- Templates or examples
+- Configuration for tools/agents
+
+Be INCLUSIVE - if it has frontmatter + markdown content that looks skill-like, mark as valid.
+Reject only if clearly not a skill (blog posts, GitHub templates, unrelated docs).
+
+File content:
+{content}
+
+Respond with JSON only:
+{{"is_skill": true/false, "reason": "one sentence"}}

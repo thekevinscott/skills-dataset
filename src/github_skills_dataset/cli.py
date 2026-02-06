@@ -41,7 +41,7 @@ def cli():
 )
 def filter_valid_skills(main_db, output_db, content_dir, model):
     """Filter SKILL.md files using Claude Message Batches API (50% discount)."""
-    from .filter import main as filter_main
+    from .filter import filter
 
     class Args:
         pass
@@ -52,7 +52,7 @@ def filter_valid_skills(main_db, output_db, content_dir, model):
     args.content_dir = content_dir
     args.model = model
 
-    asyncio.run(filter_main(args))
+    asyncio.run(filter(args))
 
 
 @cli.command()

@@ -1,7 +1,6 @@
 """Filter valid SKILL.md files using Claude via the Message Batches API (50% discount)."""
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -9,65 +8,11 @@ import sqlite3
 from pathlib import Path
 
 import anthropic
-
-VALIDATION_PROMPT = """Analyze this SKILL.md file from GitHub.
-
-A valid Claude Code skill file has:
-1. YAML frontmatter between --- markers (at the start)
-2. Markdown content after frontmatter
-3. Content that extends Claude's capabilities (instructions, workflows, knowledge, or commands)
-
-Common frontmatter fields (all optional):
-- name, description, disable-model-invocation, user-invocable, allowed-tools
-
-The content can be:
-- Reference material (API conventions, patterns, style guides)
-- Task instructions (step-by-step workflows like deploy, commit)
-- Templates or examples
-- Configuration for tools/agents
-
-Be INCLUSIVE - if it has frontmatter + markdown content that looks skill-like, mark as valid.
-Reject only if clearly not a skill (blog posts, GitHub templates, unrelated docs).
-
-File content:
-{content}
-
-Respond with JSON only:
-{{"is_skill": true/false, "reason": "one sentence"}}"""
-
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-CONTENT_MAX_BYTES = 3000      # Truncate for classification; frontmatter + intro is enough
-CACHE_DIR = Path.home() / ".cache/skills-dataset/claude"
-BATCH_CHUNK_SIZE = 10_000     # Max requests per Batches API call
-
-
-def has_valid_frontmatter(content: str) -> bool:
-    """Check if content has valid YAML frontmatter."""
-    if not content.startswith('---'):
-        return False
-    parts = content.split('---', 2)
-    if len(parts) < 3:
-        return False
-    try:
-        import yaml
-        yaml.safe_load(parts[1])
-        return True
-    except Exception:
-        return False
-
-
-def truncate_content(content: str, max_bytes: int = CONTENT_MAX_BYTES) -> str:
-    """Truncate content to max_bytes, preserving valid UTF-8."""
-    encoded = content.encode('utf-8')
-    if len(encoded) <= max_bytes:
-        return content
-    return encoded[:max_bytes].decode('utf-8', errors='ignore') + "\n[truncated]"
-
-
-def prompt_hash(content: str) -> str:
-    """Hash the full formatted prompt for cache keying."""
-    full_prompt = VALIDATION_PROMPT.format(content=content)
-    return hashlib.sha256(full_prompt.encode()).hexdigest()
+from .config import CACHE_DIR, DEFAULT_MODEL, BATCH_CHUNK_SIZE, VALIDATION_PROMPT
+from .parse_github_url import parse_github_url
+from .has_valid_frontmatter import has_valid_frontmatter
+from .prompt_hash import prompt_hash
+from .truncate_content import truncate_content
 
 
 def get_cached_result(content_hash: str) -> dict | None:
@@ -100,12 +45,6 @@ def parse_response(text: str) -> dict:
     raise ValueError(f"Could not parse JSON: {text[:200]}")
 
 
-def parse_github_url(url: str) -> tuple[str, str, str, str] | None:
-    """Parse GitHub URL into (owner, repo, ref, path)."""
-    parts = url.split('/')
-    if len(parts) < 8 or parts[2] != 'github.com' or parts[5] != 'blob':
-        return None
-    return parts[3], parts[4], parts[6], '/'.join(parts[7:])
 
 
 def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, path: str) -> Path:
@@ -157,7 +96,7 @@ def rebuild_files_table(main_db: Path, output_db: Path):
     return inserted
 
 
-async def main(args):
+async def filter(args):
     """Main filter pipeline using Anthropic Message Batches API (50% discount)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     init_output_db(args.output_db)
@@ -168,13 +107,6 @@ async def main(args):
     all_urls = [row[0] for row in main_conn.execute("SELECT url FROM files").fetchall()]
     main_conn.close()
 
-    # Already validated
-    out_conn = sqlite3.connect(args.output_db)
-    validated_urls = {row[0] for row in out_conn.execute(
-        "SELECT url FROM validation_results"
-    ).fetchall()}
-    out_conn.close()
-
     # Content on disk
     content_paths = set()
     for dirpath, _, filenames in os.walk(args.content_dir):
@@ -184,8 +116,6 @@ async def main(args):
     to_validate = []
     no_content = 0
     for url in all_urls:
-        if url in validated_urls:
-            continue
         parsed = parse_github_url(url)
         if not parsed:
             continue
@@ -195,59 +125,36 @@ async def main(args):
         else:
             no_content += 1
 
-    print(f"Total: {len(all_urls):,}, Already validated: {len(validated_urls):,}, "
-          f"Content available: {len(to_validate):,}, No content yet: {no_content:,}")
-
-    if not to_validate:
-        valid_count = rebuild_files_table(args.main_db, args.output_db)
-        print(f"\nOutput DB: {args.output_db} ({valid_count:,} valid skill files)")
-        return
-
-    # --- Phase 1: Read, frontmatter filter, truncate, check cache ---
-    local_results = []       # (url, is_skill, reason) -- immediate results
+    print(f"Total: {len(all_urls):,}, ", f"Content available: {len(to_validate):,}, No content yet: {no_content:,}")
+    local_results = []
     uncached = {}            # cache_key -> (truncated_content, [urls])
-    stats = {"frontmatter_rejected": 0, "cached": 0, "deduplicated": 0, "read_error": 0}
-
     for url in to_validate:
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
+        content = local_path.read_text(errors='replace')
+        if has_valid_frontmatter(content):
+            cache_key = prompt_hash(content)
 
-        try:
-            content = local_path.read_text(errors='replace')
-        except Exception:
-            stats["read_error"] += 1
-            local_results.append((url, False, "File read error"))
-            continue
+            cached = get_cached_result(cache_key)
+            if cached is not None:
+                local_results.append((url, cached["is_skill"], cached.get("reason", "")))
+            else:
+                truncated = truncate_content(content)
 
-        if not has_valid_frontmatter(content):
-            stats["frontmatter_rejected"] += 1
-            local_results.append((url, False, "No valid YAML frontmatter"))
-            continue
+                # Deduplicate by content -- same content across repos only needs one API call
+                if cache_key in uncached:
+                    uncached[cache_key][1].append(url)
+                else:
+                    uncached[cache_key] = (truncated, [url])
 
-        cache_key = prompt_hash(content)
-        cached = get_cached_result(cache_key)
+    total_uncached = 0
+    for k in uncached.keys():
+        _, urls = uncached[k]
+        total_uncached += len(urls)
+    print(f'Cached: {len(local_results)}, uncached: {total_uncached}')
 
-        if cached is not None:
-            stats["cached"] += 1
-            local_results.append((url, cached["is_skill"], cached.get("reason", "")))
-            continue
-
-        truncated = truncate_content(content)
-
-        # Deduplicate by content -- same content across repos only needs one API call
-        if cache_key in uncached:
-            uncached[cache_key][1].append(url)
-            stats["deduplicated"] += 1
-        else:
-            uncached[cache_key] = (truncated, [url])
-
-    print(f"Frontmatter rejected: {stats['frontmatter_rejected']:,}, "
-          f"Cached: {stats['cached']:,}, "
-          f"Unique to submit: {len(uncached):,}, "
-          f"Deduplicated: {stats['deduplicated']:,}")
-
-    # Write local results to DB immediately
+    # Write cached/frontmatter-rejected results to DB
     out_conn = sqlite3.connect(args.output_db)
     for url, is_skill, reason in local_results:
         out_conn.execute(
@@ -258,13 +165,15 @@ async def main(args):
     out_conn.close()
 
     if not uncached:
-        valid_count = rebuild_files_table(args.main_db, args.output_db)
-        print(f"\nOutput DB: {args.output_db} ({valid_count:,} valid skill files)")
+        final_valid = rebuild_files_table(args.main_db, args.output_db)
+        print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
         return
 
     # --- Phase 2: Submit to Batches API ---
     client = anthropic.AsyncAnthropic()
     unique_items = list(uncached.items())  # [(cache_key, (content, [urls]))]
+    for key in uncached.keys():
+        truncated, urls = uncached.get(key)
 
     for chunk_start in range(0, len(unique_items), BATCH_CHUNK_SIZE):
         chunk = unique_items[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
