@@ -31,7 +31,14 @@ uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
 
 ### 3. Filter valid skills
 
-Uses Claude to classify each file. Produces a filtered DB with only valid skills.
+Two-pass filter: rejects files without valid YAML frontmatter (free), then
+classifies remaining files via the Anthropic API. Results are cached on disk
+(`~/.cache/skills-dataset/claude/`) so re-runs only pay for new files. Only
+files with content on disk are processed; the rest are skipped until fetched.
+
+Defaults to `claude-haiku-4-5-20251001` (cheapest model). Local models
+(ollama) were tested but lack precision on rejection -- they let through
+blog posts and issue templates that Haiku correctly rejects.
 
 ```bash
 uv run skills-dataset filter-valid-skills \
