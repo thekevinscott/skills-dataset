@@ -32,22 +32,31 @@ uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
 ### 3. Filter valid skills
 
 Two-pass filter: rejects files without valid YAML frontmatter (free), then
-classifies remaining files via the Anthropic API. Results are cached on disk
+classifies remaining files via an LLM. Results are cached on disk
 (`~/.cache/skills-dataset/claude/`) so re-runs only pay for new files. Only
 files with content on disk are processed; the rest are skipped until fetched.
 
-Defaults to `claude-haiku-4-5-20251001` (cheapest model). Local models
-(ollama) were tested but lack precision on rejection -- they let through
-blog posts and issue templates that Haiku correctly rejects.
+Content is truncated to 3 KB for classification (frontmatter + intro is enough).
 
 ```bash
-uv run skills-dataset filter-valid-skills \
+# Using Anthropic API (default model: claude-haiku-4-5-20251001)
+uvx --from git+https://github.com/thekevinscott/skills-dataset \
+  skills-dataset filter-valid-skills \
   --main-db skills.db \
   --output-db validated.db \
   --content-dir content
+
+# Using a local model via ollama
+uvx --from git+https://github.com/thekevinscott/skills-dataset \
+  skills-dataset filter-valid-skills \
+  --main-db skills.db \
+  --output-db validated.db \
+  --content-dir content \
+  --base-url http://localhost:11434/v1 \
+  --model qwen2.5:14b
 ```
 
-Options: `--batch-size`, `--max-concurrent`, `--model`
+Options: `--model`, `--base-url`
 
 ### 4. Fetch metadata and history
 
@@ -64,7 +73,8 @@ uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
 ### 5. Export to Parquet
 
 ```bash
-uv run skills-dataset export --db validated.db --kaggle-username yourname
+uvx --from git+https://github.com/thekevinscott/skills-dataset \
+  skills-dataset export --db validated.db --kaggle-username yourname
 ```
 
 ### 6. Upload to Kaggle
@@ -79,14 +89,16 @@ cd build && kaggle datasets create -p . --dir-mode tar
 skills-dataset/
   src/github_skills_dataset/
     cli.py               # Click CLI
-    filter.py            # Two-pass validation (frontmatter + Claude)
+    filter/              # Two-pass validation (frontmatter + LLM)
+      filter.py          # Main pipeline
+      config.py          # Constants (model, cache dir, prompt)
+      has_valid_frontmatter.py
+      parse_github_url.py
+      prompt_hash.py     # Cache key generation
+      truncate_content.py
+      validation_prompt.txt
     export.py            # Parquet export
     kaggle_metadata.py   # Kaggle dataset-metadata.json generation
   pyproject.toml
   README.md
-  build/                 # Export output (gitignored)
-    files.parquet
-    repos.parquet
-    history.parquet
-    scripts/             # Source code for reproducibility
 ```
