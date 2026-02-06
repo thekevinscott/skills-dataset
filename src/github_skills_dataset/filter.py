@@ -153,7 +153,7 @@ async def process_batch(urls: list[str], content_dir: Path, semaphore: asyncio.S
                 local_path = resolve_content_path(content_dir, owner, repo, ref, path)
 
                 if not local_path.exists():
-                    return {"url": url, "is_skill": False, "reason": "File not found"}
+                    return None  # content not fetched yet; skip
 
                 content = local_path.read_text(errors='replace')
 
@@ -236,7 +236,7 @@ async def main(args):
 
     if to_validate:
         semaphore = asyncio.Semaphore(args.max_concurrent)
-        stats = {"validated": 0, "is_skill": 0, "not_skill": 0}
+        stats = {"validated": 0, "is_skill": 0, "not_skill": 0, "skipped": 0}
 
         for i in range(0, len(to_validate), args.batch_size):
             batch = to_validate[i:i + args.batch_size]
@@ -246,6 +246,10 @@ async def main(args):
 
             out_conn = sqlite3.connect(args.output_db)
             for result in results:
+                if result is None:
+                    stats["skipped"] += 1
+                    continue
+
                 url = result["url"]
                 is_skill = result.get("is_skill", False)
                 reason = result.get("reason", "")
@@ -266,7 +270,7 @@ async def main(args):
             out_conn.commit()
             out_conn.close()
 
-        print(f"\nValidated: {stats['validated']}, valid: {stats['is_skill']}, rejected: {stats['not_skill']}")
+        print(f"\nValidated: {stats['validated']}, valid: {stats['is_skill']}, rejected: {stats['not_skill']}, skipped (no content): {stats['skipped']}")
 
     # Rebuild files table with valid URLs
     valid_count = rebuild_files_table(args.main_db, args.output_db)
