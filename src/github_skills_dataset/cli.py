@@ -44,7 +44,13 @@ def cli():
     default=None,
     help="Base URL for API proxy (e.g. http://localhost:11434/v1)",
 )
-def filter_valid_skills(main_db, output_db, content_dir, model, base_url):
+@click.option(
+    "--concurrency",
+    default=10,
+    type=int,
+    help="Number of concurrent API requests (default: 10, use 1 for sequential)",
+)
+def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concurrency):
     """Filter SKILL.md files using Claude Message Batches API (50% discount)."""
     from .filter import filter
 
@@ -57,6 +63,7 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url):
     args.content_dir = content_dir
     args.model = model
     args.base_url = base_url
+    args.concurrency = concurrency
 
     asyncio.run(filter(args))
 

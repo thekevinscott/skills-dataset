@@ -8,9 +8,10 @@ import sqlite3
 from pathlib import Path
 
 import anthropic
+import httpx
 from .config import CACHE_DIR, DEFAULT_MODEL, VALIDATION_PROMPT
 
-MAX_CONCURRENT = 10
+DEFAULT_CONCURRENCY = 10
 from .parse_github_url import parse_github_url
 from .has_valid_frontmatter import has_valid_frontmatter
 from .prompt_hash import prompt_hash
@@ -129,7 +130,7 @@ async def filter(args):
 
     print(f"Total: {len(all_urls):,}, Content available: {len(to_validate):,}, No content yet: {no_content:,}")
     local_results = []
-    uncached = {}            # cache_key -> (truncated_content, [urls])
+    uncached = {}            # cache_key -> (content, [urls])
     for url in to_validate:
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
@@ -142,13 +143,11 @@ async def filter(args):
             if cached is not None:
                 local_results.append((url, cached["is_skill"], cached.get("reason", "")))
             else:
-                truncated = truncate_content(content)
-
                 # Deduplicate by content -- same content across repos only needs one API call
                 if cache_key in uncached:
                     uncached[cache_key][1].append(url)
                 else:
-                    uncached[cache_key] = (truncated, [url])
+                    uncached[cache_key] = (content, [url])
 
     total_uncached = 0
     for k in uncached.keys():
@@ -173,12 +172,14 @@ async def filter(args):
 
     # --- Phase 2: Concurrent API calls ---
     base_url = getattr(args, 'base_url', None)
+    concurrency = getattr(args, 'concurrency', DEFAULT_CONCURRENCY)
     client_kwargs = {}
     if base_url:
         client_kwargs["base_url"] = base_url
-        client_kwargs["api_key"] = "not-needed"
+        # Dummy key required by SDK even for local endpoints
+        client_kwargs["api_key"] = "sk-ant-dummy-key-for-local-endpoint"
     client = anthropic.AsyncAnthropic(**client_kwargs)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    semaphore = asyncio.Semaphore(concurrency)
 
     async def validate_one(cache_key, content):
         async with semaphore:
@@ -196,43 +197,61 @@ async def filter(args):
     valid_count = 0
     invalid_count = 0
     error_count = 0
+    first_error = None
+    completed = 0
+    total = len(unique_items)
 
-    # Process in chunks to write results incrementally
-    chunk_size = 100
-    for chunk_start in range(0, len(unique_items), chunk_size):
-        chunk = unique_items[chunk_start:chunk_start + chunk_size]
-        print(f"\nChunk {chunk_start // chunk_size + 1} ({len(chunk)} unique files):")
+    async def process_one(cache_key, content, urls):
+        """Validate and return result with metadata."""
+        try:
+            result = await validate_one(cache_key, content)
+            is_skill = result.get("is_skill", False)
+            reason = result.get("reason", "")
+            return cache_key, urls, is_skill, reason, None
+        except Exception as e:
+            return cache_key, urls, False, f"Error: {str(e)[:80]}", e
 
-        tasks = {cache_key: asyncio.create_task(validate_one(cache_key, content))
-                 for cache_key, (content, _urls) in chunk}
+    # Launch all tasks - semaphore controls concurrency
+    tasks = [
+        asyncio.create_task(process_one(cache_key, content, urls))
+        for cache_key, (content, urls) in unique_items
+    ]
 
-        for cache_key, task in tasks.items():
-            _, urls = uncached[cache_key]
-            try:
-                result = await task
-                is_skill = result.get("is_skill", False)
-                reason = result.get("reason", "")
-            except Exception as e:
-                is_skill = False
-                reason = f"Error: {str(e)[:80]}"
-                error_count += 1
+    print(f"\nProcessing {total:,} unique files (concurrency: {concurrency})...")
 
-            insert_cached_result(cache_key, is_skill, reason)
+    for coro in asyncio.as_completed(tasks):
+        cache_key, urls, is_skill, reason, error = await coro
+        completed += 1
 
-            for url in urls:
-                out_conn.execute(
-                    "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
-                    (url, is_skill, reason)
-                )
-                if is_skill:
-                    valid_count += 1
-                else:
-                    invalid_count += 1
+        if error and first_error is None:
+            first_error = error
+            print(f"\nFirst error: {first_error}")
 
-        out_conn.commit()
-        print(f"  valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
+        if error:
+            error_count += 1
 
+        insert_cached_result(cache_key, is_skill, reason)
+
+        for url in urls:
+            out_conn.execute(
+                "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
+                (url, is_skill, reason)
+            )
+            if is_skill:
+                valid_count += 1
+            else:
+                invalid_count += 1
+
+        # Running progress on same line
+        print(f"\r{completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}  ", end="", flush=True)
+
+        # Commit every 100
+        if completed % 100 == 0:
+            out_conn.commit()
+
+    out_conn.commit()
     out_conn.close()
+    print(f"\nDone: {completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
 
     # --- Phase 4: Rebuild files table (always runs) ---
     final_valid = rebuild_files_table(args.main_db, args.output_db)
