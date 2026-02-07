@@ -19,14 +19,14 @@ uv sync
 
 ```bash
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
-  github-fetch fetch-file-paths "filename:SKILL.md" --db skills.db
+  github-fetch fetch-file-paths "filename:SKILL.md" --db data/skills.db
 ```
 
 ### 2. Fetch file content
 
 ```bash
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
-  github-fetch fetch-file-content --db skills.db --content-dir content
+  github-fetch fetch-file-content --db data/skills.db --content-dir data/content
 ```
 
 ### 3. Filter valid skills
@@ -42,16 +42,16 @@ Content is truncated to 3 KB for classification (frontmatter + intro is enough).
 # Using Anthropic API (default model: claude-haiku-4-5-20251001)
 uvx --from git+https://github.com/thekevinscott/skills-dataset \
   skills-dataset filter-valid-skills \
-  --main-db skills.db \
-  --output-db validated.db \
-  --content-dir content
+  --main-db data/skills.db \
+  --output-db data/validated.db \
+  --content-dir data/content
 
 # Using a local model via ollama
 uvx --from git+https://github.com/thekevinscott/skills-dataset \
   skills-dataset filter-valid-skills \
-  --main-db skills.db \
-  --output-db validated.db \
-  --content-dir content \
+  --main-db data/skills.db \
+  --output-db data/validated.db \
+  --content-dir data/content \
   --base-url http://localhost:11434/v1 \
   --model qwen2.5:14b
 ```
@@ -64,17 +64,17 @@ Run against the filtered DB so we only fetch data for valid skills.
 
 ```bash
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
-  github-fetch fetch-repo-metadata --db validated.db
+  github-fetch fetch-repo-metadata --db data/validated.db
 
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
-  github-fetch fetch-file-history --db validated.db
+  github-fetch fetch-file-history --db data/validated.db
 ```
 
 ### 5. Export to Parquet
 
 ```bash
 uvx --from git+https://github.com/thekevinscott/skills-dataset \
-  skills-dataset export --db validated.db --kaggle-username yourname
+  skills-dataset export --db data/validated.db --kaggle-username yourname
 ```
 
 ### 6. Upload to Kaggle

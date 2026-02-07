@@ -1,6 +1,4 @@
-*.db
-results/
-content/
+data/
 .venv/
 .env
 __pycache__/
