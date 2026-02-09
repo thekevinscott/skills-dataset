@@ -56,7 +56,7 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
 
 
 def init_output_db(output_db: Path):
-    """Create the output database with validation_results and files tables."""
+    """Create the output database with validation_results table."""
     conn = sqlite3.connect(output_db)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS validation_results (
@@ -65,38 +65,10 @@ def init_output_db(output_db: Path):
             reason TEXT,
             validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS files (
-            url TEXT PRIMARY KEY,
-            sha TEXT,
-            size_bytes INTEGER,
-            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
     """)
     conn.commit()
     conn.close()
 
-
-def rebuild_files_table(main_db: Path, output_db: Path):
-    """Copy valid file rows from main DB into output DB's files table."""
-    out = sqlite3.connect(output_db)
-    out.execute("DELETE FROM files")
-
-    main = sqlite3.connect(main_db)
-    valid_urls = {row[0] for row in out.execute(
-        "SELECT url FROM validation_results WHERE is_skill = 1"
-    ).fetchall()}
-
-    rows = main.execute("SELECT url, sha, size_bytes, discovered_at FROM files").fetchall()
-    inserted = 0
-    for row in rows:
-        if row[0] in valid_urls:
-            out.execute("INSERT OR IGNORE INTO files VALUES (?,?,?,?)", row)
-            inserted += 1
-
-    out.commit()
-    main.close()
-    out.close()
-    return inserted
 
 
 async def filter(args):
@@ -129,9 +101,24 @@ async def filter(args):
             no_content += 1
 
     print(f"Total: {len(all_urls):,}, Content available: {len(to_validate):,}, No content yet: {no_content:,}")
+
+    # Load existing results from output DB (skip URLs already processed without errors)
+    out_conn = sqlite3.connect(args.output_db)
+    existing_results = {}
+    for row in out_conn.execute(
+        "SELECT url, is_skill, reason FROM validation_results WHERE reason NOT LIKE 'Error:%'"
+    ).fetchall():
+        existing_results[row[0]] = (row[1], row[2])
+    out_conn.close()
+
     local_results = []
     uncached = {}            # cache_key -> (content, [urls])
+    skipped_db = 0
     for url in to_validate:
+        # Skip if already in DB with valid result
+        if url in existing_results:
+            skipped_db += 1
+            continue
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
@@ -153,7 +140,7 @@ async def filter(args):
     for k in uncached.keys():
         _, urls = uncached[k]
         total_uncached += len(urls)
-    print(f'Cached: {len(local_results)}, uncached: {total_uncached}')
+    print(f'Already in DB: {skipped_db:,}, cached: {len(local_results):,}, uncached: {total_uncached:,}')
 
     # Write cached/frontmatter-rejected results to DB
     out_conn = sqlite3.connect(args.output_db)
@@ -166,7 +153,9 @@ async def filter(args):
     out_conn.close()
 
     if not uncached:
-        final_valid = rebuild_files_table(args.main_db, args.output_db)
+        conn = sqlite3.connect(args.output_db)
+        final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
+        conn.close()
         print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
         return
 
@@ -202,14 +191,19 @@ async def filter(args):
     total = len(unique_items)
 
     async def process_one(cache_key, content, urls):
-        """Validate and return result with metadata."""
-        try:
-            result = await validate_one(cache_key, content)
-            is_skill = result.get("is_skill", False)
-            reason = result.get("reason", "")
-            return cache_key, urls, is_skill, reason, None
-        except Exception as e:
-            return cache_key, urls, False, f"Error: {str(e)[:80]}", e
+        """Validate and return result with metadata, retrying up to 3 times."""
+        last_error = None
+        for attempt in range(3):
+            try:
+                result = await validate_one(cache_key, content)
+                is_skill = result.get("is_skill", False)
+                reason = result.get("reason", "")
+                return cache_key, urls, is_skill, reason, None
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    await asyncio.sleep(2 * (attempt + 1))  # Longer backoff: 2s, 4s
+        return cache_key, urls, False, f"Error: {str(last_error)[:80]}", last_error
 
     # Launch all tasks - semaphore controls concurrency
     tasks = [
@@ -229,8 +223,9 @@ async def filter(args):
 
         if error:
             error_count += 1
-
-        insert_cached_result(cache_key, is_skill, reason)
+        else:
+            # Only cache successful results, not errors
+            insert_cached_result(cache_key, is_skill, reason)
 
         for url in urls:
             out_conn.execute(
@@ -253,6 +248,7 @@ async def filter(args):
     out_conn.close()
     print(f"\nDone: {completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
 
-    # --- Phase 4: Rebuild files table (always runs) ---
-    final_valid = rebuild_files_table(args.main_db, args.output_db)
+    conn = sqlite3.connect(args.output_db)
+    final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
+    conn.close()
     print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")

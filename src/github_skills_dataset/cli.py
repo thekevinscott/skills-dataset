@@ -70,10 +70,16 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concur
 
 @cli.command()
 @click.option(
-    "--db",
+    "--main-db",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Source database with files/repos/history (from github-data-file-fetcher)",
+)
+@click.option(
+    "--validation-db",
     type=click.Path(path_type=Path),
     default=Path("validated.db"),
-    help="Database with valid skills (from filter-valid-skills)",
+    help="Validation database with is_skill verdicts (default: validated.db)",
 )
 @click.option(
     "--output-dir",
@@ -85,7 +91,19 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concur
     "--kaggle-username",
     help="Kaggle username for metadata generation",
 )
-def export(db, output_dir, kaggle_username):
+@click.option(
+    "--allow-no-repo",
+    is_flag=True,
+    default=False,
+    help="Allow export even if some valid files have no repo metadata",
+)
+@click.option(
+    "--allow-no-history",
+    is_flag=True,
+    default=False,
+    help="Allow export even if some valid files have no commit history",
+)
+def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history):
     """Export validated skills to Parquet for Kaggle."""
     from .export import main as export_main
 
@@ -93,9 +111,12 @@ def export(db, output_dir, kaggle_username):
         pass
 
     args = Args()
-    args.db = db
+    args.main_db = main_db
+    args.validation_db = validation_db
     args.output_dir = output_dir
     args.kaggle_username = kaggle_username
+    args.allow_no_repo = allow_no_repo
+    args.allow_no_history = allow_no_history
 
     export_main(args)
 
