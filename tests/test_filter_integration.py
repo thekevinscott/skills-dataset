@@ -112,15 +112,16 @@ class TestPass1Integration:
         assert env.urls["no_fm"] in state
         assert state[env.urls["no_fm"]][0] == 0  # has_frontmatter=0
 
-        # valid files should NOT be in DB yet (pass 2's job)
-        assert env.urls["valid1"] not in state
-        assert env.urls["valid2"] not in state
+        # valid files should be in DB with has_frontmatter=1, is_skill=NULL
+        assert env.urls["valid1"] in state
+        assert state[env.urls["valid1"]][0] == 1
+        assert state[env.urls["valid1"]][1] is None  # not yet classified
 
         # no_content not in DB (no file on disk)
         assert env.urls["no_content"] not in state
 
-    def test_rerun_is_fast(self, env):
-        """Second run of pass 1 should not re-read files."""
+    def test_rerun_reads_no_files(self, env):
+        """Second run of pass 1 should not re-read any files."""
         asyncio.run(filter_pass1(_args(env)))
 
         original_read_text = Path.read_text
@@ -134,22 +135,15 @@ class TestPass1Integration:
             asyncio.run(filter_pass1(_args(env)))
 
         content_reads = [f for f in reads if "content" in f]
-        # valid1 and valid2 aren't in DB (pass 1 doesn't store them),
-        # so they'll be re-read. But no_fm should be skipped.
-        no_fm_reads = [f for f in content_reads if "repo3" in f]
-        assert len(no_fm_reads) == 0, f"Frontmatter failure re-read: {no_fm_reads}"
+        assert len(content_reads) == 0, f"No files should be re-read, got: {content_reads}"
 
 
 class TestPass2Integration:
     def test_classifies_via_llm(self, env):
         """Pass 2 calls LLM for files with frontmatter and stores results."""
-        # Run pass 1 first
         asyncio.run(filter_pass1(_args(env)))
 
-        # Mock the LLM
-        responses = {
-            "Test Skill": (True, "Valid skill file"),
-        }
+        responses = {"Test Skill": (True, "Valid skill file")}
         client = _mock_anthropic_client(responses)
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
@@ -188,8 +182,7 @@ class TestFullPipelineIntegration:
             asyncio.run(filter(_args(env)))
 
         state = _db_state(env.output_db)
-        # All 3 on-disk URLs should have results
-        assert len(state) == 3
+        assert len(state) == 3  # 2 valid + 1 no_fm
         assert state[env.urls["valid1"]][1] == 1
         assert state[env.urls["valid2"]][1] == 1
         assert state[env.urls["no_fm"]][0] == 0
@@ -208,3 +201,14 @@ class TestFullPipelineIntegration:
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client2):
             asyncio.run(filter(_args(env)))  # Should not raise
+
+    def test_scan_runs_once_in_combined(self, env):
+        """filter() should only scan content once, not twice."""
+        responses = {"Test Skill": (True, "Valid skill file")}
+        client = _mock_anthropic_client(responses)
+
+        with mock.patch("anthropic.AsyncAnthropic", return_value=client), \
+             mock.patch("github_skills_dataset.filter.filter.scan_content", wraps=__import__("github_skills_dataset.filter.filter", fromlist=["scan_content"]).scan_content) as mock_scan:
+            asyncio.run(filter(_args(env)))
+
+        assert mock_scan.call_count == 1

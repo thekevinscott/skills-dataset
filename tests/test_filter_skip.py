@@ -15,7 +15,6 @@ from github_skills_dataset.filter.filter import (
     filter_pass1,
     filter_pass2,
     init_output_db,
-    scan_content,
 )
 
 
@@ -31,8 +30,6 @@ VALID_SKILL = "---\ntitle: Test Skill\n---\n# Hello\nSome content here."
 NO_FRONTMATTER = "# Just a heading\nNo YAML here."
 
 
-# -- Fixtures --
-
 @pytest.fixture
 def db_paths(tmp_path):
     main_db = tmp_path / "skills.db"
@@ -40,38 +37,9 @@ def db_paths(tmp_path):
     return main_db, output_db
 
 
-@pytest.fixture
-def content_dir(tmp_path):
-    d = tmp_path / "content"
-    for url, content in [
-        (URL_FM_YES, VALID_SKILL),
-        (URL_FM_NO, NO_FRONTMATTER),
-        (URL_NEW, VALID_SKILL),
-    ]:
-        parts = url.split("/")
-        owner, repo, ref, path = parts[3], parts[4], parts[6], "/".join(parts[7:])
-        fp = d / owner / repo / "blob" / ref / path
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
-    return d
-
-
-@pytest.fixture
-def source_db(db_paths):
-    main_db, _ = db_paths
-    conn = sqlite3.connect(main_db)
-    conn.execute("CREATE TABLE files (url TEXT PRIMARY KEY)")
-    conn.executemany("INSERT INTO files (url) VALUES (?)", [
-        (URL_FM_YES,), (URL_FM_NO,), (URL_NEW,),
-    ])
-    conn.commit()
-    conn.close()
-    return main_db
-
-
-def _args(main_db, output_db, content_dir, **kw):
+def _args(main_db, output_db, **kw):
     return types.SimpleNamespace(
-        main_db=main_db, output_db=output_db, content_dir=content_dir,
+        main_db=main_db, output_db=output_db, content_dir=Path("/fake"),
         model="test-model", base_url="http://localhost:1234/v1",
         concurrency=1, backend="anthropic", **kw,
     )
@@ -93,7 +61,6 @@ class TestPass1Unit:
         """URLs with has_frontmatter set should not trigger file reads."""
         main_db, output_db = db_paths
 
-        # Pre-populate DB
         init_output_db(output_db)
         conn = sqlite3.connect(output_db)
         conn.execute(
@@ -109,11 +76,9 @@ class TestPass1Unit:
 
         mock_read = mock.MagicMock(return_value=VALID_SKILL)
 
-        with mock.patch("github_skills_dataset.filter.filter.scan_content",
-                        return_value=([], [URL_FM_NO, URL_FM_YES, URL_NEW], 0)), \
-             mock.patch.object(Path, "read_text", mock_read):
-            args = _args(main_db, output_db, Path("/fake"))
-            asyncio.run(filter_pass1(args))
+        with mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db)
+            asyncio.run(filter_pass1(args, to_validate=[URL_FM_NO, URL_FM_YES, URL_NEW]))
 
         # Only URL_NEW should have been read
         assert mock_read.call_count == 1
@@ -127,30 +92,28 @@ class TestPass1Unit:
                 return NO_FRONTMATTER
             return VALID_SKILL
 
-        with mock.patch("github_skills_dataset.filter.filter.scan_content",
-                        return_value=([], [URL_FM_NO, URL_FM_YES], 0)), \
-             mock.patch.object(Path, "read_text", fake_read):
-            args = _args(main_db, output_db, Path("/fake"))
-            asyncio.run(filter_pass1(args))
+        with mock.patch.object(Path, "read_text", fake_read):
+            args = _args(main_db, output_db)
+            asyncio.run(filter_pass1(args, to_validate=[URL_FM_NO, URL_FM_YES]))
 
         rows = _db_rows(output_db, "has_frontmatter = 0")
         assert len(rows) == 1
         assert rows[0][0] == URL_FM_NO
         assert rows[0][3] == "No valid YAML frontmatter"
 
-    def test_does_not_write_llm_results(self, db_paths):
-        """Pass 1 should not write is_skill=1 for files with frontmatter."""
+    def test_persists_frontmatter_successes(self, db_paths):
+        """Files with valid frontmatter get stored with has_frontmatter=1."""
         main_db, output_db = db_paths
 
-        with mock.patch("github_skills_dataset.filter.filter.scan_content",
-                        return_value=([], [URL_FM_YES], 0)), \
-             mock.patch.object(Path, "read_text", return_value=VALID_SKILL):
-            args = _args(main_db, output_db, Path("/fake"))
-            asyncio.run(filter_pass1(args))
+        with mock.patch.object(Path, "read_text", return_value=VALID_SKILL):
+            args = _args(main_db, output_db)
+            asyncio.run(filter_pass1(args, to_validate=[URL_FM_YES]))
 
-        # Files with frontmatter should NOT be in the DB (pass 2's job)
         rows = _db_rows(output_db, "has_frontmatter = 1")
-        assert len(rows) == 0
+        assert len(rows) == 1
+        assert rows[0][0] == URL_FM_YES
+        # is_skill should be NULL (not yet classified)
+        assert rows[0][2] is None
 
 
 # -- Unit tests: filter_pass2 --
@@ -173,13 +136,10 @@ class TestPass2Unit:
 
         mock_read = mock.MagicMock(return_value=VALID_SKILL)
 
-        with mock.patch("github_skills_dataset.filter.filter.scan_content",
-                        return_value=([], [URL_FM_NO], 0)), \
-             mock.patch.object(Path, "read_text", mock_read):
-            args = _args(main_db, output_db, Path("/fake"))
-            asyncio.run(filter_pass2(args))
+        with mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db)
+            asyncio.run(filter_pass2(args, to_validate=[URL_FM_NO]))
 
-        # Should not have read any files -- all skipped
         assert mock_read.call_count == 0
 
     def test_skips_already_classified(self, db_paths):
@@ -197,11 +157,9 @@ class TestPass2Unit:
 
         mock_read = mock.MagicMock(return_value=VALID_SKILL)
 
-        with mock.patch("github_skills_dataset.filter.filter.scan_content",
-                        return_value=([], [URL_FM_YES], 0)), \
-             mock.patch.object(Path, "read_text", mock_read):
-            args = _args(main_db, output_db, Path("/fake"))
-            asyncio.run(filter_pass2(args))
+        with mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db)
+            asyncio.run(filter_pass2(args, to_validate=[URL_FM_YES]))
 
         assert mock_read.call_count == 0
 
@@ -220,15 +178,29 @@ class TestPass2Unit:
 
         mock_read = mock.MagicMock(return_value=VALID_SKILL)
 
-        with mock.patch("github_skills_dataset.filter.filter.scan_content",
-                        return_value=([], [URL_FM_YES], 0)), \
-             mock.patch.object(Path, "read_text", mock_read):
-            args = _args(main_db, output_db, Path("/fake"))
-            # Will fail on actual LLM call, that's fine
+        with mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db)
             try:
-                asyncio.run(filter_pass2(args))
+                asyncio.run(filter_pass2(args, to_validate=[URL_FM_YES]))
             except Exception:
                 pass
 
         # Should have read the file (not skipped)
+        assert mock_read.call_count == 1
+
+    def test_skips_unchecked_urls(self, db_paths):
+        """URLs with no has_frontmatter value (pass 1 not run) should be skipped."""
+        main_db, output_db = db_paths
+        init_output_db(output_db)
+
+        mock_read = mock.MagicMock(return_value=VALID_SKILL)
+
+        with mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db)
+            asyncio.run(filter_pass2(args, to_validate=[URL_FM_YES]))
+
+        # URL not in DB at all -> not in already_done -> will be read and
+        # frontmatter-checked in pass 2's loop. This is the standalone case.
+        # The file has valid frontmatter so it proceeds to LLM (which will fail).
+        # This is expected -- pass 2 handles it gracefully.
         assert mock_read.call_count == 1

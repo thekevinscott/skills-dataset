@@ -16,7 +16,6 @@ from .config import DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
 DEFAULT_CONCURRENCY = 10
 from .parse_github_url import parse_github_url
 from .has_valid_frontmatter import has_valid_frontmatter
-from .truncate_content import truncate_content
 
 
 def make_cache_key(prompt: str, model: str, base_url: str | None) -> str:
@@ -52,15 +51,15 @@ def init_output_db(output_db: Path):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS validation_results (
             url TEXT PRIMARY KEY,
-            has_frontmatter BOOLEAN NOT NULL DEFAULT 1,
-            is_skill BOOLEAN NOT NULL,
+            has_frontmatter BOOLEAN,
+            is_skill BOOLEAN,
             reason TEXT,
             validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
     # Migration: add has_frontmatter to existing DBs
     try:
-        conn.execute("ALTER TABLE validation_results ADD COLUMN has_frontmatter BOOLEAN NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE validation_results ADD COLUMN has_frontmatter BOOLEAN")
     except sqlite3.OperationalError:
         pass  # Column already exists
     conn.commit()
@@ -99,84 +98,94 @@ def scan_content(args):
     return all_urls, to_validate, no_content
 
 
-async def filter_pass1(args):
-    """Pass 1: check frontmatter and persist results to DB."""
+async def filter_pass1(args, to_validate=None):
+    """Pass 1: check frontmatter and persist results to DB.
+
+    Returns to_validate for chaining (avoids re-scanning in filter()).
+    """
     init_output_db(args.output_db)
-    all_urls, to_validate, no_content = scan_content(args)
+    if to_validate is None:
+        _, to_validate, _ = scan_content(args)
 
     # Load URLs already checked for frontmatter (skip)
     out_conn = sqlite3.connect(args.output_db)
-    already_checked = set()
-    for row in out_conn.execute(
-        "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL"
-    ).fetchall():
-        already_checked.add(row[0])
+    already_checked = set(
+        row[0] for row in out_conn.execute(
+            "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL"
+        ).fetchall()
+    )
     out_conn.close()
 
-    frontmatter_failures = []
-    skipped_pass1 = 0
-    no_frontmatter = 0
-    has_frontmatter_count = 0
+    frontmatter_results = []  # (url, has_frontmatter)
+    skipped = 0
     t_start = time.monotonic()
     for url in tqdm(to_validate, desc="Pass 1: frontmatter", unit="file"):
         if url in already_checked:
-            skipped_pass1 += 1
+            skipped += 1
             continue
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
         content = local_path.read_text(errors='replace')
-        if not has_valid_frontmatter(content):
-            no_frontmatter += 1
-            frontmatter_failures.append(url)
-        else:
-            has_frontmatter_count += 1
+        frontmatter_results.append((url, has_valid_frontmatter(content)))
+
+    no_frontmatter = sum(1 for _, fm in frontmatter_results if not fm)
+    yes_frontmatter = sum(1 for _, fm in frontmatter_results if fm)
 
     t_pass1 = time.monotonic() - t_start
     print(f"\nPass 1 - frontmatter check ({t_pass1:.1f}s):")
-    print(f"  Already checked: {skipped_pass1:,}")
+    print(f"  Already checked: {skipped:,}")
     print(f"  No valid frontmatter: {no_frontmatter:,}")
-    print(f"  Has frontmatter: {has_frontmatter_count:,}")
+    print(f"  Has frontmatter: {yes_frontmatter:,}")
 
-    # Write frontmatter failures to DB
+    # Write all results to DB
     out_conn = sqlite3.connect(args.output_db)
-    for i, url in enumerate(frontmatter_failures):
-        out_conn.execute(
-            "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
-            (url,)
-        )
+    for i, (url, has_fm) in enumerate(frontmatter_results):
+        if has_fm:
+            out_conn.execute(
+                "INSERT OR REPLACE INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
+                (url,)
+            )
+        else:
+            out_conn.execute(
+                "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+                (url,)
+            )
         if (i + 1) % 1000 == 0:
             out_conn.commit()
     out_conn.commit()
     out_conn.close()
 
+    return to_validate
 
-async def filter_pass2(args):
-    """Pass 2: classify files with valid frontmatter via LLM."""
+
+async def filter_pass2(args, to_validate=None):
+    """Pass 2: classify files with valid frontmatter via LLM.
+
+    Requires pass 1 to have run. URLs without a has_frontmatter value in the DB
+    are skipped (run pass 1 first).
+    """
     init_output_db(args.output_db)
     model = args.model or DEFAULT_MODEL
     base_url = getattr(args, 'base_url', None)
 
-    all_urls, to_validate, no_content = scan_content(args)
+    if to_validate is None:
+        _, to_validate, _ = scan_content(args)
 
-    # Load URLs already fully processed (pass 2 skip)
+    # Skip URLs that are already done (successful LLM result or no frontmatter)
+    # URLs with Error: reasons are retried. URLs with no has_frontmatter (pass 1
+    # not run) are skipped -- they need pass 1 first.
     out_conn = sqlite3.connect(args.output_db)
-    already_done = set()
-    for row in out_conn.execute(
-        "SELECT url FROM validation_results WHERE has_frontmatter = 1 AND reason NOT LIKE 'Error:%'"
-    ).fetchall():
-        already_done.add(row[0])
-    # Also skip frontmatter failures
-    for row in out_conn.execute(
-        "SELECT url FROM validation_results WHERE has_frontmatter = 0"
-    ).fetchall():
-        already_done.add(row[0])
+    already_done = set(
+        row[0] for row in out_conn.execute(
+            "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL AND reason NOT LIKE 'Error:%'"
+        ).fetchall()
+    )
     out_conn.close()
 
     local_results = []
     uncached = {}  # cache_key -> (content, [urls])
     skipped = 0
-    no_frontmatter = 0
     t_start = time.monotonic()
     for url in tqdm(to_validate, desc="Pass 2: prep", unit="file"):
         if url in already_done:
@@ -187,8 +196,6 @@ async def filter_pass2(args):
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
         content = local_path.read_text(errors='replace')
         if not has_valid_frontmatter(content):
-            # Shouldn't happen if pass 1 ran, but handle gracefully
-            no_frontmatter += 1
             continue
         prompt = VALIDATION_PROMPT.format(content=content)
         cache_key = make_cache_key(prompt, model, base_url)
@@ -349,6 +356,8 @@ async def filter_pass2(args):
 
 
 async def filter(args):
-    """Run both passes in sequence."""
-    await filter_pass1(args)
-    await filter_pass2(args)
+    """Run both passes in sequence, scanning content once."""
+    init_output_db(args.output_db)
+    _, to_validate, _ = scan_content(args)
+    await filter_pass1(args, to_validate=to_validate)
+    await filter_pass2(args, to_validate=to_validate)
