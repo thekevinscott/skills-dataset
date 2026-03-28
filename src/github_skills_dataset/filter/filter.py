@@ -49,20 +49,48 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
 def init_output_db(output_db: Path):
     """Create the output database with validation_results table."""
     conn = sqlite3.connect(output_db)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS validation_results (
-            url TEXT PRIMARY KEY,
-            has_frontmatter BOOLEAN,
-            is_skill BOOLEAN,
-            reason TEXT,
-            validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    # Migration: add has_frontmatter to existing DBs
-    try:
-        conn.execute("ALTER TABLE validation_results ADD COLUMN has_frontmatter BOOLEAN")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+
+    # Check if table exists and needs migration (is_skill NOT NULL -> nullable)
+    existing = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='validation_results'"
+    ).fetchone()
+
+    if existing:
+        # Check if is_skill has NOT NULL constraint (old schema)
+        cols = {row[1]: row[3] for row in conn.execute("PRAGMA table_info(validation_results)")}
+        needs_migration = cols.get("is_skill", 0) == 1  # notnull=1
+
+        if needs_migration:
+            conn.executescript("""
+                CREATE TABLE validation_results_new (
+                    url TEXT PRIMARY KEY,
+                    has_frontmatter BOOLEAN,
+                    is_skill BOOLEAN,
+                    reason TEXT,
+                    validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO validation_results_new (url, has_frontmatter, is_skill, reason, validated_at)
+                    SELECT url, has_frontmatter, is_skill, reason, validated_at FROM validation_results;
+                DROP TABLE validation_results;
+                ALTER TABLE validation_results_new RENAME TO validation_results;
+            """)
+        else:
+            # Add has_frontmatter if missing (very old DBs)
+            try:
+                conn.execute("ALTER TABLE validation_results ADD COLUMN has_frontmatter BOOLEAN")
+            except sqlite3.OperationalError:
+                pass
+    else:
+        conn.executescript("""
+            CREATE TABLE validation_results (
+                url TEXT PRIMARY KEY,
+                has_frontmatter BOOLEAN,
+                is_skill BOOLEAN,
+                reason TEXT,
+                validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
     conn.commit()
     conn.close()
 
@@ -108,7 +136,7 @@ async def filter_pass1(args, to_validate=None):
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
-    # Load URLs already checked for frontmatter (skip)
+    # Filter out URLs already checked for frontmatter
     out_conn = sqlite3.connect(args.output_db)
     already_checked = set(
         row[0] for row in out_conn.execute(
@@ -117,13 +145,13 @@ async def filter_pass1(args, to_validate=None):
     )
     out_conn.close()
 
+    unchecked = [url for url in to_validate if url not in already_checked]
+    skipped = len(to_validate) - len(unchecked)
+    print(f"  Already checked: {skipped:,}, to check: {len(unchecked):,}")
+
     frontmatter_results = []  # (url, has_frontmatter)
-    skipped = 0
     t_start = time.monotonic()
-    for url in tqdm(to_validate, desc="Pass 1: frontmatter", unit="file"):
-        if url in already_checked:
-            skipped += 1
-            continue
+    for url in tqdm(unchecked, desc="Pass 1: frontmatter", unit="file"):
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
@@ -135,7 +163,6 @@ async def filter_pass1(args, to_validate=None):
 
     t_pass1 = time.monotonic() - t_start
     print(f"\nPass 1 - frontmatter check ({t_pass1:.1f}s):")
-    print(f"  Already checked: {skipped:,}")
     print(f"  No valid frontmatter: {no_frontmatter:,}")
     print(f"  Has frontmatter: {yes_frontmatter:,}")
 
@@ -181,14 +208,14 @@ async def filter_pass2(args, to_validate=None):
     )
     out_conn.close()
 
+    to_classify = [url for url in to_validate if url not in already_done]
+    skipped = len(to_validate) - len(to_classify)
+    print(f"  Already done: {skipped:,}, to classify: {len(to_classify):,}")
+
     local_results = []
     uncached = {}  # cache_key -> (content, [urls])
-    skipped = 0
     t_start = time.monotonic()
-    for url in tqdm(to_validate, desc="Pass 2: prep", unit="file"):
-        if url in already_done:
-            skipped += 1
-            continue
+    for url in tqdm(to_classify, desc="Pass 2: prep", unit="file"):
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
@@ -214,7 +241,6 @@ async def filter_pass2(args, to_validate=None):
 
     t_prep = time.monotonic() - t_start
     print(f"\nPass 2 - LLM classification ({t_prep:.1f}s prep):")
-    print(f"  Already done: {skipped:,}")
     print(f"  Cached (no API call): {len(local_results):,}")
     print(f"  Need LLM call: {total_uncached:,}")
 
