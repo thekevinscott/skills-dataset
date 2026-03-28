@@ -1,6 +1,8 @@
 """CLI for GitHub Skills Dataset."""
 
 import asyncio
+import types
+
 import click
 from pathlib import Path
 from dotenv import load_dotenv
@@ -49,12 +51,7 @@ def _apply_options(options):
 
 def _make_args(**kwargs):
     """Convert click kwargs to an args namespace."""
-    class Args:
-        pass
-    args = Args()
-    for k, v in kwargs.items():
-        setattr(args, k, v)
-    return args
+    return types.SimpleNamespace(**kwargs)
 
 
 @cli.command("filter-valid-skills-pass-1")

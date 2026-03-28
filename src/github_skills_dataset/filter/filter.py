@@ -11,11 +11,12 @@ from pathlib import Path
 
 from cachetta import async_read_cache, async_write_cache
 from tqdm import tqdm
-from .config import DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
 
-DEFAULT_CONCURRENCY = 10
+from .config import DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
 from .parse_github_url import parse_github_url
 from .has_valid_frontmatter import has_valid_frontmatter
+
+DEFAULT_CONCURRENCY = 10
 
 
 def make_cache_key(prompt: str, model: str, base_url: str | None) -> str:
@@ -138,17 +139,17 @@ async def filter_pass1(args, to_validate=None):
     print(f"  No valid frontmatter: {no_frontmatter:,}")
     print(f"  Has frontmatter: {yes_frontmatter:,}")
 
-    # Write all results to DB
+    # Write results to DB (INSERT OR IGNORE to avoid clobbering existing pass 2 results)
     out_conn = sqlite3.connect(args.output_db)
     for i, (url, has_fm) in enumerate(frontmatter_results):
         if has_fm:
             out_conn.execute(
-                "INSERT OR REPLACE INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
+                "INSERT OR IGNORE INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
                 (url,)
             )
         else:
             out_conn.execute(
-                "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+                "INSERT OR IGNORE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
                 (url,)
             )
         if (i + 1) % 1000 == 0:
@@ -160,11 +161,7 @@ async def filter_pass1(args, to_validate=None):
 
 
 async def filter_pass2(args, to_validate=None):
-    """Pass 2: classify files with valid frontmatter via LLM.
-
-    Requires pass 1 to have run. URLs without a has_frontmatter value in the DB
-    are skipped (run pass 1 first).
-    """
+    """Pass 2: classify files with valid frontmatter via LLM."""
     init_output_db(args.output_db)
     model = args.model or DEFAULT_MODEL
     base_url = getattr(args, 'base_url', None)
@@ -172,13 +169,14 @@ async def filter_pass2(args, to_validate=None):
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
-    # Skip URLs that are already done (successful LLM result or no frontmatter)
-    # URLs with Error: reasons are retried. URLs with no has_frontmatter (pass 1
-    # not run) are skipped -- they need pass 1 first.
+    # Skip URLs already done:
+    #   - has_frontmatter=0: no frontmatter, no LLM needed
+    #   - reason IS NOT NULL AND reason NOT LIKE 'Error:%': LLM already classified
+    # Retry: rows with Error: reasons. Process: rows with has_frontmatter=1, reason IS NULL.
     out_conn = sqlite3.connect(args.output_db)
     already_done = set(
         row[0] for row in out_conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL AND reason NOT LIKE 'Error:%'"
+            "SELECT url FROM validation_results WHERE has_frontmatter = 0 OR (reason IS NOT NULL AND reason NOT LIKE 'Error:%')"
         ).fetchall()
     )
     out_conn.close()
