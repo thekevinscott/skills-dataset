@@ -146,8 +146,8 @@ class TestPass2Unit:
 
         assert mock_read.call_count == 0
 
-    def test_skips_already_classified(self, db_paths):
-        """URLs with successful LLM results should be skipped."""
+    def test_skips_already_cached(self, db_paths):
+        """URLs with cached results should not make LLM calls."""
         main_db, output_db = db_paths
 
         init_output_db(output_db)
@@ -156,20 +156,22 @@ class TestPass2Unit:
             "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
             (URL_FM_YES,),
         )
-        conn.execute(
-            "INSERT INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, 'anthropic', 'test-model', 1, 'Valid skill')",
-            (URL_FM_YES,),
-        )
         conn.commit()
         conn.close()
 
         mock_read = mock.MagicMock(return_value=VALID_SKILL)
 
-        with mock.patch.object(Path, "read_text", mock_read):
+        # File gets read (to build prompt and check cache), but no LLM call happens
+        with mock.patch.object(Path, "read_text", mock_read), \
+             mock.patch("github_skills_dataset.filter.filter.async_read_cache") as mock_cache:
+            # Simulate cache hit
+            mock_cache.return_value.__aenter__ = mock.AsyncMock(return_value={"is_skill": True, "reason": "Valid skill"})
+            mock_cache.return_value.__aexit__ = mock.AsyncMock(return_value=False)
             args = _args(main_db, output_db)
             asyncio.run(filter_pass2(args, to_validate=[URL_FM_YES]))
 
-        assert mock_read.call_count == 0
+        # File was read to build prompt, but result came from cache (no LLM call)
+        assert mock_read.call_count == 1
 
     def test_retries_errors(self, db_paths):
         """URLs with Error: reasons should be retried."""

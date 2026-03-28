@@ -199,22 +199,16 @@ async def filter_pass2(args, to_validate=None):
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
+    # Only skip frontmatter failures (from pass 1 DB). LLM skip is handled by file cache.
     out_conn = sqlite3.connect(args.output_db)
     no_frontmatter = set(
         row[0] for row in out_conn.execute(
             "SELECT url FROM validation_results WHERE has_frontmatter = 0"
         ).fetchall()
     )
-    already_evaluated = set(
-        row[0] for row in out_conn.execute(
-            "SELECT url FROM llm_skill_evaluation WHERE backend = ? AND model = ? AND reason NOT LIKE 'Error:%'",
-            (backend, model)
-        ).fetchall()
-    )
     out_conn.close()
 
-    skip = no_frontmatter | already_evaluated
-    to_classify = [url for url in to_validate if url not in skip]
+    to_classify = [url for url in to_validate if url not in no_frontmatter]
     skipped = len(to_validate) - len(to_classify)
 
     limit = getattr(args, 'limit', None)
