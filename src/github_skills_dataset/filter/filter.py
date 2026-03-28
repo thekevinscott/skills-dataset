@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from cachetta import async_read_cache, async_write_cache
+from tqdm import tqdm
 from .config import DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
 
 DEFAULT_CONCURRENCY = 10
@@ -53,11 +54,17 @@ def init_output_db(output_db: Path):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS validation_results (
             url TEXT PRIMARY KEY,
+            has_frontmatter BOOLEAN NOT NULL DEFAULT 1,
             is_skill BOOLEAN NOT NULL,
             reason TEXT,
             validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # Migration: add has_frontmatter to existing DBs
+    try:
+        conn.execute("ALTER TABLE validation_results ADD COLUMN has_frontmatter BOOLEAN NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -108,11 +115,12 @@ async def filter(args):
     out_conn.close()
 
     local_results = []
+    frontmatter_failures = []
     uncached = {}            # cache_key -> (content, [urls])
     skipped_db = 0
     no_frontmatter = 0
     t_start = time.monotonic()
-    for url in to_validate:
+    for url in tqdm(to_validate, desc="Pass 1: frontmatter", unit="file"):
         # Skip if already in DB with valid result
         if url in existing_results:
             skipped_db += 1
@@ -123,6 +131,7 @@ async def filter(args):
         content = local_path.read_text(errors='replace')
         if not has_valid_frontmatter(content):
             no_frontmatter += 1
+            frontmatter_failures.append(url)
             continue
         prompt = VALIDATION_PROMPT.format(content=content)
         cache_key = make_cache_key(prompt, model, base_url)
@@ -152,11 +161,18 @@ async def filter(args):
     print(f"  Cached (no API call): {len(local_results):,}")
     print(f"  Need LLM call: {total_uncached:,}")
 
-    # Write cached/frontmatter-rejected results to DB
+    # Write frontmatter failures and cached results to DB
     out_conn = sqlite3.connect(args.output_db)
+    for i, url in enumerate(frontmatter_failures):
+        out_conn.execute(
+            "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+            (url,)
+        )
+        if (i + 1) % 1000 == 0:
+            out_conn.commit()
     for url, is_skill, reason in local_results:
         out_conn.execute(
-            "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
             (url, is_skill, reason)
         )
     out_conn.commit()
@@ -246,15 +262,14 @@ async def filter(args):
     ]
 
     t_start = time.monotonic()
-    print(f"\nProcessing {total:,} unique files (concurrency: {concurrency})...")
-
-    for coro in asyncio.as_completed(tasks):
+    bar = tqdm(asyncio.as_completed(tasks), total=total, desc="Pass 2: LLM", unit="file")
+    for coro in bar:
         cache_key, urls, is_skill, reason, error = await coro
         completed += 1
 
         if error and first_error is None:
             first_error = error
-            print(f"\nFirst error: {first_error}")
+            tqdm.write(f"First error: {first_error}")
 
         if error:
             error_count += 1
@@ -265,7 +280,7 @@ async def filter(args):
 
         for url in urls:
             out_conn.execute(
-                "INSERT OR REPLACE INTO validation_results (url, is_skill, reason) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
                 (url, is_skill, reason)
             )
             if is_skill:
@@ -273,8 +288,7 @@ async def filter(args):
             else:
                 invalid_count += 1
 
-        # Running progress on same line
-        print(f"\r{completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}  ", end="", flush=True)
+        bar.set_postfix(valid=valid_count, rejected=invalid_count, errors=error_count)
 
         # Commit every 100
         if completed % 100 == 0:
@@ -283,7 +297,7 @@ async def filter(args):
     out_conn.commit()
     out_conn.close()
     t_pass2 = time.monotonic() - t_start
-    print(f"\nDone in {t_pass2:.1f}s: {completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
+    print(f"Done in {t_pass2:.1f}s: valid={valid_count:,}, rejected={invalid_count:,}, errors={error_count:,}")
 
     conn = sqlite3.connect(args.output_db)
     final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
