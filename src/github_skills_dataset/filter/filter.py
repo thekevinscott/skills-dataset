@@ -210,6 +210,11 @@ async def filter_pass2(args, to_validate=None):
 
     to_classify = [url for url in to_validate if url not in already_done]
     skipped = len(to_validate) - len(to_classify)
+
+    limit = getattr(args, 'limit', None)
+    if limit is not None:
+        to_classify = to_classify[:limit]
+
     print(f"  Already done: {skipped:,}, to classify: {len(to_classify):,}")
 
     local_results = []

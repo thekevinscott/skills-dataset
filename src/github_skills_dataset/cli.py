@@ -66,12 +66,14 @@ def filter_pass1_cmd(main_db, output_db, content_dir):
 
 @cli.command("filter-valid-skills-pass-2")
 @_apply_options(_filter_common_options + _filter_llm_options)
-def filter_pass2_cmd(main_db, output_db, content_dir, model, base_url, concurrency, backend):
+@click.option("--limit", default=None, type=int, help="Process at most N URLs (for testing)")
+def filter_pass2_cmd(main_db, output_db, content_dir, model, base_url, concurrency, backend, limit):
     """Pass 2: classify files with valid frontmatter via LLM."""
     from .filter import filter_pass2
     asyncio.run(filter_pass2(_make_args(
         main_db=main_db, output_db=output_db, content_dir=content_dir,
         model=model, base_url=base_url, concurrency=concurrency, backend=backend,
+        limit=limit,
     )))
 
 
