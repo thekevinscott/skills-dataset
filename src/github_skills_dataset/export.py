@@ -10,12 +10,23 @@ class MissingDataError(Exception):
     pass
 
 
-def load_valid_urls(validation_db: Path) -> pl.DataFrame:
-    """Read validated URLs from the validation database."""
+def load_valid_urls(validation_db: Path, model: str | None = None) -> pl.DataFrame:
+    """Read validated URLs from the validation database.
+
+    If model is specified, only use that model's evaluations.
+    Otherwise, a URL is valid if any model marked it as a skill.
+    """
     conn = sqlite3.connect(validation_db)
-    df = pl.read_database(
-        "SELECT url FROM validation_results WHERE is_skill = 1", conn
-    )
+    if model:
+        df = pl.read_database(
+            "SELECT DISTINCT url FROM llm_skill_evaluation WHERE is_skill = 1 AND model = ?",
+            conn,
+            execute_options={"parameters": [model]},
+        )
+    else:
+        df = pl.read_database(
+            "SELECT DISTINCT url FROM llm_skill_evaluation WHERE is_skill = 1", conn
+        )
     conn.close()
     return df
 
@@ -106,9 +117,10 @@ def main(args):
     """Main export pipeline."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    model = getattr(args, 'model', None)
     print("Loading valid URLs from validation DB...")
-    valid_urls_df = load_valid_urls(args.validation_db)
-    print(f"  {len(valid_urls_df):,} valid skill URLs")
+    valid_urls_df = load_valid_urls(args.validation_db, model=model)
+    print(f"  {len(valid_urls_df):,} valid skill URLs" + (f" (model: {model})" if model else ""))
 
     print("Exporting files.parquet...")
     files_df = export_files(args.main_db, valid_urls_df, args.output_dir / "files.parquet")

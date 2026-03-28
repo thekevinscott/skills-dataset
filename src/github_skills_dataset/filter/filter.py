@@ -47,64 +47,62 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
 
 
 def init_output_db(output_db: Path):
-    """Create the output database with validation_results table."""
+    """Create/migrate the output database."""
     conn = sqlite3.connect(output_db)
 
-    # Check if table exists and needs migration (is_skill NOT NULL -> nullable)
+    # --- validation_results: pass 1 (frontmatter check) ---
     existing = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='validation_results'"
     ).fetchone()
 
     if existing:
-        # Check if is_skill has NOT NULL constraint (old schema)
-        cols = {row[1]: row[3] for row in conn.execute("PRAGMA table_info(validation_results)")}
-        needs_migration = cols.get("is_skill", 0) == 1  # notnull=1
-
-        if needs_migration:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(validation_results)")}
+        if "is_skill" in cols:
+            # Migrate: drop is_skill and reason, keep url + has_frontmatter
             conn.executescript("""
                 CREATE TABLE validation_results_new (
                     url TEXT PRIMARY KEY,
-                    has_frontmatter BOOLEAN,
-                    is_skill BOOLEAN,
-                    reason TEXT,
-                    validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    has_frontmatter BOOLEAN NOT NULL,
+                    checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-                INSERT INTO validation_results_new (url, has_frontmatter, is_skill, reason, validated_at)
-                    SELECT url, has_frontmatter, is_skill, reason, validated_at FROM validation_results;
+                INSERT OR IGNORE INTO validation_results_new (url, has_frontmatter)
+                    SELECT url, COALESCE(has_frontmatter, 0) FROM validation_results;
                 DROP TABLE validation_results;
                 ALTER TABLE validation_results_new RENAME TO validation_results;
             """)
-        else:
-            # Add has_frontmatter if missing (very old DBs)
-            try:
-                conn.execute("ALTER TABLE validation_results ADD COLUMN has_frontmatter BOOLEAN")
-            except sqlite3.OperationalError:
-                pass
     else:
-        conn.executescript("""
+        conn.execute("""
             CREATE TABLE validation_results (
                 url TEXT PRIMARY KEY,
-                has_frontmatter BOOLEAN,
-                is_skill BOOLEAN,
-                reason TEXT,
-                validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+                has_frontmatter BOOLEAN NOT NULL,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         """)
 
-    # Multi-model evaluation table
-    conn = sqlite3.connect(output_db)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS llm_skill_evaluation (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT NOT NULL,
-            backend TEXT NOT NULL,
-            model TEXT NOT NULL,
-            is_skill BOOLEAN NOT NULL,
-            reason TEXT,
-            evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(url, backend, model)
-        )
-    """)
+    # --- llm_skill_evaluation: pass 2 (LLM classification) ---
+    eval_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='llm_skill_evaluation'"
+    ).fetchone()
+
+    if eval_exists:
+        eval_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_skill_evaluation)")}
+        if "base_url" not in eval_cols:
+            conn.execute("ALTER TABLE llm_skill_evaluation ADD COLUMN base_url TEXT")
+    else:
+        conn.execute("""
+            CREATE TABLE llm_skill_evaluation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT,
+                backend TEXT NOT NULL,
+                model TEXT NOT NULL,
+                base_url TEXT,
+                is_skill BOOLEAN NOT NULL,
+                reason TEXT,
+                evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(url, backend, model)
+            )
+        """)
+
     conn.commit()
     conn.close()
 
@@ -150,12 +148,9 @@ async def filter_pass1(args, to_validate=None):
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
-    # Filter out URLs already checked for frontmatter
     out_conn = sqlite3.connect(args.output_db)
     already_checked = set(
-        row[0] for row in out_conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL"
-        ).fetchall()
+        row[0] for row in out_conn.execute("SELECT url FROM validation_results").fetchall()
     )
     out_conn.close()
 
@@ -163,7 +158,7 @@ async def filter_pass1(args, to_validate=None):
     skipped = len(to_validate) - len(unchecked)
     print(f"  Already checked: {skipped:,}, to check: {len(unchecked):,}")
 
-    frontmatter_results = []  # (url, has_frontmatter)
+    frontmatter_results = []
     t_start = time.monotonic()
     for url in tqdm(unchecked, desc="Pass 1: frontmatter", unit="file"):
         parsed = parse_github_url(url)
@@ -180,19 +175,12 @@ async def filter_pass1(args, to_validate=None):
     print(f"  No valid frontmatter: {no_frontmatter:,}")
     print(f"  Has frontmatter: {yes_frontmatter:,}")
 
-    # Write results to DB (INSERT OR IGNORE to avoid clobbering existing pass 2 results)
     out_conn = sqlite3.connect(args.output_db)
     for i, (url, has_fm) in enumerate(frontmatter_results):
-        if has_fm:
-            out_conn.execute(
-                "INSERT OR IGNORE INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
-                (url,)
-            )
-        else:
-            out_conn.execute(
-                "INSERT OR IGNORE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
-                (url,)
-            )
+        out_conn.execute(
+            "INSERT OR IGNORE INTO validation_results (url, has_frontmatter) VALUES (?, ?)",
+            (url, 1 if has_fm else 0)
+        )
         if (i + 1) % 1000 == 0:
             out_conn.commit()
     out_conn.commit()
@@ -211,19 +199,22 @@ async def filter_pass2(args, to_validate=None):
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
-    # Skip URLs already done:
-    #   - has_frontmatter=0: no frontmatter, no LLM needed
-    #   - reason IS NOT NULL AND reason NOT LIKE 'Error:%': LLM already classified
-    # Retry: rows with Error: reasons. Process: rows with has_frontmatter=1, reason IS NULL.
     out_conn = sqlite3.connect(args.output_db)
-    already_done = set(
+    no_frontmatter = set(
         row[0] for row in out_conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter = 0 OR (reason IS NOT NULL AND reason NOT LIKE 'Error:%')"
+            "SELECT url FROM validation_results WHERE has_frontmatter = 0"
+        ).fetchall()
+    )
+    already_evaluated = set(
+        row[0] for row in out_conn.execute(
+            "SELECT url FROM llm_skill_evaluation WHERE backend = ? AND model = ? AND reason NOT LIKE 'Error:%'",
+            (backend, model)
         ).fetchall()
     )
     out_conn.close()
 
-    to_classify = [url for url in to_validate if url not in already_done]
+    skip = no_frontmatter | already_evaluated
+    to_classify = [url for url in to_validate if url not in skip]
     skipped = len(to_validate) - len(to_classify)
 
     limit = getattr(args, 'limit', None)
@@ -233,7 +224,7 @@ async def filter_pass2(args, to_validate=None):
     print(f"  Already done: {skipped:,}, to classify: {len(to_classify):,}")
 
     local_results = []
-    uncached = {}  # cache_key -> (content, [urls])
+    uncached = {}
     t_start = time.monotonic()
     for url in tqdm(to_classify, desc="Pass 2: prep", unit="file"):
         parsed = parse_github_url(url)
@@ -251,7 +242,6 @@ async def filter_pass2(args, to_validate=None):
                 local_results.append((url, cached["is_skill"], cached.get("reason", "")))
                 continue
 
-        # Deduplicate by content -- same content across repos only needs one API call
         if cache_key in uncached:
             uncached[cache_key][1].append(url)
         else:
@@ -264,25 +254,23 @@ async def filter_pass2(args, to_validate=None):
     print(f"  Cached (no API call): {len(local_results):,}")
     print(f"  Need LLM call: {total_uncached:,}")
 
-    # Write cached results to DB
     out_conn = sqlite3.connect(args.output_db)
     for url, is_skill, reason in local_results:
         out_conn.execute(
-            "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
-            (url, is_skill, reason)
-        )
-        out_conn.execute(
-            "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, ?, ?, ?, ?)",
-            (url, backend, model, is_skill, reason)
+            "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, base_url, is_skill, reason) VALUES (?, ?, ?, ?, ?, ?)",
+            (url, backend, model, base_url, is_skill, reason)
         )
     out_conn.commit()
     out_conn.close()
 
     if not uncached:
         conn = sqlite3.connect(args.output_db)
-        final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
+        final_valid = conn.execute(
+            "SELECT COUNT(*) FROM llm_skill_evaluation WHERE is_skill = 1 AND backend = ? AND model = ?",
+            (backend, model)
+        ).fetchone()[0]
         conn.close()
-        print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
+        print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files for {backend}/{model})")
         return
 
     # --- Concurrent API calls ---
@@ -372,7 +360,6 @@ async def filter_pass2(args, to_validate=None):
                     await asyncio.sleep(2 * (attempt + 1))
         return cache_key, urls, False, f"Error: {str(last_error)[:80]}", last_error
 
-    # Launch all tasks - semaphore controls concurrency
     tasks = [
         asyncio.create_task(process_one(cache_key, content, urls))
         for cache_key, (content, urls) in unique_items
@@ -396,12 +383,8 @@ async def filter_pass2(args, to_validate=None):
 
         for url in urls:
             out_conn.execute(
-                "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
-                (url, is_skill, reason)
-            )
-            out_conn.execute(
-                "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, ?, ?, ?, ?)",
-                (url, backend, model, is_skill, reason)
+                "INSERT OR REPLACE INTO llm_skill_evaluation (url, backend, model, base_url, is_skill, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (url, backend, model, base_url, is_skill, reason)
             )
             if is_skill:
                 valid_count += 1
@@ -419,9 +402,12 @@ async def filter_pass2(args, to_validate=None):
     print(f"Done in {t_pass2:.1f}s: valid={valid_count:,}, rejected={invalid_count:,}, errors={error_count:,}")
 
     conn = sqlite3.connect(args.output_db)
-    final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
+    final_valid = conn.execute(
+        "SELECT COUNT(*) FROM llm_skill_evaluation WHERE is_skill = 1 AND backend = ? AND model = ?",
+        (backend, model)
+    ).fetchone()[0]
     conn.close()
-    print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
+    print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files for {backend}/{model})")
 
 
 async def filter(args):

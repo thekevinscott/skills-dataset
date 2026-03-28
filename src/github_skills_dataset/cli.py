@@ -100,13 +100,15 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concur
               help="Allow export even if some valid files have no repo metadata")
 @click.option("--allow-no-history", is_flag=True, default=False,
               help="Allow export even if some valid files have no commit history")
-def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history):
+@click.option("--model", default=None,
+              help="Use only this model's evaluations (default: any model)")
+def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history, model):
     """Export validated skills to Parquet for Kaggle."""
     from .export import main as export_main
     export_main(_make_args(
         main_db=main_db, validation_db=validation_db, output_dir=output_dir,
         kaggle_username=kaggle_username, allow_no_repo=allow_no_repo,
-        allow_no_history=allow_no_history,
+        allow_no_history=allow_no_history, model=model,
     ))
 
 

@@ -105,14 +105,14 @@ def env(tmp_path):
     )
 
 
-def _db_rows(output_db):
-    """Return {url: (has_frontmatter, is_skill, reason)} for all rows."""
+def _eval_rows(output_db):
+    """Return {url: (is_skill, reason)} from llm_skill_evaluation."""
     conn = sqlite3.connect(output_db)
     rows = conn.execute(
-        "SELECT url, has_frontmatter, is_skill, reason FROM validation_results"
+        "SELECT url, is_skill, reason FROM llm_skill_evaluation"
     ).fetchall()
     conn.close()
-    return {r[0]: (r[1], r[2], r[3]) for r in rows}
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 def _run_pass2(env, backend, **kwargs):
@@ -124,7 +124,7 @@ def _run_pass2(env, backend, **kwargs):
     asyncio.run(filter_pass1(args))
     args.backend = backend
     asyncio.run(filter_pass2(args))
-    return _db_rows(env.output_db)
+    return _eval_rows(env.output_db)
 
 
 OLLAMA_URL = "http://tower.tail790bbc.ts.net:11434/v1"
@@ -143,14 +143,12 @@ class TestOllamaBackend:
         skill_row = state[env.urls["skill"]]
         not_skill_row = state[env.urls["not_skill"]]
 
-        # Both should have been classified (is_skill is not None, no Error in reason)
-        assert skill_row[1] is not None, f"skill not classified: {skill_row}"
-        assert not_skill_row[1] is not None, f"not_skill not classified: {not_skill_row}"
-        assert not skill_row[2] or "Error" not in (skill_row[2] or ""), f"skill errored: {skill_row}"
-        assert not not_skill_row[2] or "Error" not in (not_skill_row[2] or ""), f"not_skill errored: {not_skill_row}"
+        assert skill_row[0] is not None, f"skill not classified: {skill_row}"
+        assert not_skill_row[0] is not None, f"not_skill not classified: {not_skill_row}"
+        assert "Error" not in (skill_row[1] or ""), f"skill errored: {skill_row}"
+        assert "Error" not in (not_skill_row[1] or ""), f"not_skill errored: {not_skill_row}"
 
-        # The skill should be classified as a skill
-        assert skill_row[1] == 1, f"Expected valid skill, got: {skill_row}"
+        assert skill_row[0] == 1, f"Expected valid skill, got: {skill_row}"
 
     def test_non_skill_rejected(self, env):
         """Blog post with frontmatter should be rejected."""
@@ -160,7 +158,7 @@ class TestOllamaBackend:
         )
 
         not_skill_row = state[env.urls["not_skill"]]
-        assert not_skill_row[1] == 0, f"Expected rejected, got: {not_skill_row}"
+        assert not_skill_row[0] == 0, f"Expected rejected, got: {not_skill_row}"
 
 
 @pytest.mark.e2e
@@ -175,11 +173,11 @@ class TestAgentSDKBackend:
         skill_row = state[env.urls["skill"]]
         not_skill_row = state[env.urls["not_skill"]]
 
-        assert skill_row[1] is not None, f"skill not classified: {skill_row}"
-        assert not_skill_row[1] is not None, f"not_skill not classified: {not_skill_row}"
-        assert not skill_row[2] or "Error" not in (skill_row[2] or ""), f"skill errored: {skill_row}"
+        assert skill_row[0] is not None, f"skill not classified: {skill_row}"
+        assert not_skill_row[0] is not None, f"not_skill not classified: {not_skill_row}"
+        assert "Error" not in (skill_row[1] or ""), f"skill errored: {skill_row}"
 
-        assert skill_row[1] == 1, f"Expected valid skill, got: {skill_row}"
+        assert skill_row[0] == 1, f"Expected valid skill, got: {skill_row}"
 
     def test_non_skill_rejected(self, env):
         """Blog post with frontmatter should be rejected."""
@@ -189,4 +187,4 @@ class TestAgentSDKBackend:
         )
 
         not_skill_row = state[env.urls["not_skill"]]
-        assert not_skill_row[1] == 0, f"Expected rejected, got: {not_skill_row}"
+        assert not_skill_row[0] == 0, f"Expected rejected, got: {not_skill_row}"

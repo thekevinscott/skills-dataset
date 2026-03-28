@@ -74,12 +74,20 @@ def _args(env, **kw):
     )
 
 
-def _db_state(output_db):
-    """Return {url: (has_frontmatter, is_skill, reason)} for all rows."""
+def _frontmatter_state(output_db):
+    """Return {url: has_frontmatter} from validation_results."""
     conn = sqlite3.connect(output_db)
-    rows = conn.execute("SELECT url, has_frontmatter, is_skill, reason FROM validation_results").fetchall()
+    rows = conn.execute("SELECT url, has_frontmatter FROM validation_results").fetchall()
     conn.close()
-    return {r[0]: (r[1], r[2], r[3]) for r in rows}
+    return {r[0]: r[1] for r in rows}
+
+
+def _eval_state(output_db):
+    """Return {url: (is_skill, reason)} from llm_skill_evaluation."""
+    conn = sqlite3.connect(output_db)
+    rows = conn.execute("SELECT url, is_skill, reason FROM llm_skill_evaluation").fetchall()
+    conn.close()
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 def _mock_anthropic_client(responses):
@@ -106,18 +114,14 @@ class TestPass1Integration:
         """Pass 1 correctly separates files with/without frontmatter."""
         asyncio.run(filter_pass1(_args(env)))
 
-        state = _db_state(env.output_db)
+        state = _frontmatter_state(env.output_db)
 
-        # no_fm should be rejected
         assert env.urls["no_fm"] in state
-        assert state[env.urls["no_fm"]][0] == 0  # has_frontmatter=0
+        assert state[env.urls["no_fm"]] == 0
 
-        # valid files should be in DB with has_frontmatter=1, is_skill=NULL
         assert env.urls["valid1"] in state
-        assert state[env.urls["valid1"]][0] == 1
-        assert state[env.urls["valid1"]][1] is None  # not yet classified
+        assert state[env.urls["valid1"]] == 1
 
-        # no_content not in DB (no file on disk)
         assert env.urls["no_content"] not in state
 
     def test_rerun_reads_no_files(self, env):
@@ -149,10 +153,10 @@ class TestPass2Integration:
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
             asyncio.run(filter_pass2(_args(env)))
 
-        state = _db_state(env.output_db)
-        assert state[env.urls["valid1"]][1] == 1  # is_skill=1
-        assert state[env.urls["valid2"]][1] == 1
-        assert state[env.urls["no_fm"]][0] == 0  # still has_frontmatter=0
+        evals = _eval_state(env.output_db)
+        assert evals[env.urls["valid1"]][0] == 1  # is_skill=1
+        assert evals[env.urls["valid2"]][0] == 1
+        assert env.urls["no_fm"] not in evals  # no frontmatter, no eval
 
     def test_skips_completed_on_rerun(self, env):
         """Re-running pass 2 should not re-call LLM for completed URLs."""
@@ -164,7 +168,6 @@ class TestPass2Integration:
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
             asyncio.run(filter_pass2(_args(env)))
 
-        # Second run -- LLM should not be called
         client2 = _mock_anthropic_client({})
         client2.messages.create = mock.AsyncMock(side_effect=Exception("Should not be called"))
 
@@ -181,11 +184,13 @@ class TestFullPipelineIntegration:
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
             asyncio.run(filter(_args(env)))
 
-        state = _db_state(env.output_db)
-        assert len(state) == 3  # 2 valid + 1 no_fm
-        assert state[env.urls["valid1"]][1] == 1
-        assert state[env.urls["valid2"]][1] == 1
-        assert state[env.urls["no_fm"]][0] == 0
+        fm = _frontmatter_state(env.output_db)
+        assert len(fm) == 3  # 2 valid + 1 no_fm
+        assert fm[env.urls["no_fm"]] == 0
+
+        evals = _eval_state(env.output_db)
+        assert evals[env.urls["valid1"]][0] == 1
+        assert evals[env.urls["valid2"]][0] == 1
 
     def test_rerun_after_full_pipeline(self, env):
         """Full re-run should skip everything."""
@@ -195,7 +200,6 @@ class TestFullPipelineIntegration:
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
             asyncio.run(filter(_args(env)))
 
-        # Re-run -- nothing should be called
         client2 = _mock_anthropic_client({})
         client2.messages.create = mock.AsyncMock(side_effect=Exception("Should not be called"))
 

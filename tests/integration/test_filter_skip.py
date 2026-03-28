@@ -45,9 +45,16 @@ def _args(main_db, output_db, **kw):
     )
 
 
-def _db_rows(output_db, where="1=1"):
+def _fm_rows(output_db, where="1=1"):
     conn = sqlite3.connect(output_db)
-    rows = conn.execute(f"SELECT url, has_frontmatter, is_skill, reason FROM validation_results WHERE {where}").fetchall()
+    rows = conn.execute(f"SELECT url, has_frontmatter FROM validation_results WHERE {where}").fetchall()
+    conn.close()
+    return rows
+
+
+def _eval_rows(output_db, where="1=1"):
+    conn = sqlite3.connect(output_db)
+    rows = conn.execute(f"SELECT url, is_skill, reason FROM llm_skill_evaluation WHERE {where}").fetchall()
     conn.close()
     return rows
 
@@ -58,17 +65,17 @@ class TestPass1Unit:
     """Unit tests for filter_pass1. Mocks: scan_content, has_valid_frontmatter, file I/O."""
 
     def test_skips_already_checked_urls(self, db_paths):
-        """URLs with has_frontmatter set should not trigger file reads."""
+        """URLs in validation_results should not trigger file reads."""
         main_db, output_db = db_paths
 
         init_output_db(output_db)
         conn = sqlite3.connect(output_db)
         conn.execute(
-            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+            "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 0)",
             (URL_FM_NO,),
         )
         conn.execute(
-            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 1, 'Valid skill')",
+            "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
             (URL_FM_YES,),
         )
         conn.commit()
@@ -96,10 +103,9 @@ class TestPass1Unit:
             args = _args(main_db, output_db)
             asyncio.run(filter_pass1(args, to_validate=[URL_FM_NO, URL_FM_YES]))
 
-        rows = _db_rows(output_db, "has_frontmatter = 0")
+        rows = _fm_rows(output_db, "has_frontmatter = 0")
         assert len(rows) == 1
         assert rows[0][0] == URL_FM_NO
-        assert rows[0][3] == "No valid YAML frontmatter"
 
     def test_persists_frontmatter_successes(self, db_paths):
         """Files with valid frontmatter get stored with has_frontmatter=1."""
@@ -109,11 +115,9 @@ class TestPass1Unit:
             args = _args(main_db, output_db)
             asyncio.run(filter_pass1(args, to_validate=[URL_FM_YES]))
 
-        rows = _db_rows(output_db, "has_frontmatter = 1")
+        rows = _fm_rows(output_db, "has_frontmatter = 1")
         assert len(rows) == 1
         assert rows[0][0] == URL_FM_YES
-        # is_skill should be NULL (not yet classified)
-        assert rows[0][2] is None
 
 
 # -- Unit tests: filter_pass2 --
@@ -128,7 +132,7 @@ class TestPass2Unit:
         init_output_db(output_db)
         conn = sqlite3.connect(output_db)
         conn.execute(
-            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+            "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 0)",
             (URL_FM_NO,),
         )
         conn.commit()
@@ -149,7 +153,11 @@ class TestPass2Unit:
         init_output_db(output_db)
         conn = sqlite3.connect(output_db)
         conn.execute(
-            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 1, 'Valid skill')",
+            "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
+            (URL_FM_YES,),
+        )
+        conn.execute(
+            "INSERT INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, 'anthropic', 'test-model', 1, 'Valid skill')",
             (URL_FM_YES,),
         )
         conn.commit()
@@ -170,7 +178,11 @@ class TestPass2Unit:
         init_output_db(output_db)
         conn = sqlite3.connect(output_db)
         conn.execute(
-            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 0, 'Error: 404')",
+            "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 1)",
+            (URL_FM_YES,),
+        )
+        conn.execute(
+            "INSERT INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, 'anthropic', 'test-model', 0, 'Error: 404')",
             (URL_FM_YES,),
         )
         conn.commit()
@@ -189,7 +201,7 @@ class TestPass2Unit:
         assert mock_read.call_count == 1
 
     def test_skips_unchecked_urls(self, db_paths):
-        """URLs with no has_frontmatter value (pass 1 not run) should be skipped."""
+        """URLs not in validation_results are not in no_frontmatter set, so they proceed."""
         main_db, output_db = db_paths
         init_output_db(output_db)
 
@@ -199,8 +211,5 @@ class TestPass2Unit:
             args = _args(main_db, output_db)
             asyncio.run(filter_pass2(args, to_validate=[URL_FM_YES]))
 
-        # URL not in DB at all -> not in already_done -> will be read and
-        # frontmatter-checked in pass 2's loop. This is the standalone case.
-        # The file has valid frontmatter so it proceeds to LLM (which will fail).
-        # This is expected -- pass 2 handles it gracefully.
+        # URL not in validation_results -> not in no_frontmatter -> proceeds to prep
         assert mock_read.call_count == 1
