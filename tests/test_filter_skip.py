@@ -1,171 +1,234 @@
-"""Test that pass 1 skips URLs already checked for frontmatter."""
+"""Unit tests for filter pass 1 and pass 2 skip logic.
+
+Unit tests mock everything except the function under test.
+"""
 
 import asyncio
 import sqlite3
 import types
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
-from github_skills_dataset.filter.filter import filter, init_output_db
+from github_skills_dataset.filter.filter import (
+    filter_pass1,
+    filter_pass2,
+    init_output_db,
+    scan_content,
+)
 
 
-def make_url(owner, repo, ref, path):
+def make_url(owner, repo, ref="main", path="SKILL.md"):
     return f"https://github.com/{owner}/{repo}/blob/{ref}/{path}"
 
 
-URL_WITH_FRONTMATTER = make_url("org", "repo1", "main", "SKILL.md")
-URL_NO_FRONTMATTER = make_url("org", "repo2", "main", "SKILL.md")
-URL_NEW = make_url("org", "repo3", "main", "SKILL.md")
+URL_FM_YES = make_url("org", "repo1")
+URL_FM_NO = make_url("org", "repo2")
+URL_NEW = make_url("org", "repo3")
 
 VALID_SKILL = "---\ntitle: Test Skill\n---\n# Hello\nSome content here."
 NO_FRONTMATTER = "# Just a heading\nNo YAML here."
 
 
+# -- Fixtures --
+
 @pytest.fixture
-def setup_dirs(tmp_path):
-    """Create source DB, output DB, and content files."""
+def db_paths(tmp_path):
     main_db = tmp_path / "skills.db"
     output_db = tmp_path / "validated.db"
-    content_dir = tmp_path / "content"
+    return main_db, output_db
 
-    # Create source DB with 3 URLs
-    conn = sqlite3.connect(main_db)
-    conn.execute("CREATE TABLE files (url TEXT PRIMARY KEY)")
-    conn.executemany("INSERT INTO files (url) VALUES (?)", [
-        (URL_WITH_FRONTMATTER,),
-        (URL_NO_FRONTMATTER,),
-        (URL_NEW,),
-    ])
-    conn.commit()
-    conn.close()
 
-    # Create content files for all 3
+@pytest.fixture
+def content_dir(tmp_path):
+    d = tmp_path / "content"
     for url, content in [
-        (URL_WITH_FRONTMATTER, VALID_SKILL),
-        (URL_NO_FRONTMATTER, NO_FRONTMATTER),
+        (URL_FM_YES, VALID_SKILL),
+        (URL_FM_NO, NO_FRONTMATTER),
         (URL_NEW, VALID_SKILL),
     ]:
         parts = url.split("/")
         owner, repo, ref, path = parts[3], parts[4], parts[6], "/".join(parts[7:])
-        file_path = content_dir / owner / repo / "blob" / ref / path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
-
-    return main_db, output_db, content_dir
-
-
-def make_args(main_db, output_db, content_dir, **kwargs):
-    args = types.SimpleNamespace(
-        main_db=main_db,
-        output_db=output_db,
-        content_dir=content_dir,
-        model="test-model",
-        base_url="http://localhost:1234/v1",
-        concurrency=1,
-        backend="anthropic",
-        **kwargs,
-    )
-    return args
+        fp = d / owner / repo / "blob" / ref / path
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+    return d
 
 
-def test_pass1_skips_already_checked_frontmatter(setup_dirs):
-    """URLs with has_frontmatter already set in DB should not be re-read from disk."""
-    main_db, output_db, content_dir = setup_dirs
-
-    # Pre-populate output DB: mark URL_NO_FRONTMATTER as already checked (no frontmatter)
-    init_output_db(output_db)
-    conn = sqlite3.connect(output_db)
-    conn.execute(
-        "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
-        (URL_NO_FRONTMATTER,),
-    )
-    # Mark URL_WITH_FRONTMATTER as already LLM-classified
-    conn.execute(
-        "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 1, 'Valid skill')",
-        (URL_WITH_FRONTMATTER,),
-    )
+@pytest.fixture
+def source_db(db_paths):
+    main_db, _ = db_paths
+    conn = sqlite3.connect(main_db)
+    conn.execute("CREATE TABLE files (url TEXT PRIMARY KEY)")
+    conn.executemany("INSERT INTO files (url) VALUES (?)", [
+        (URL_FM_YES,), (URL_FM_NO,), (URL_NEW,),
+    ])
     conn.commit()
     conn.close()
-
-    # Track which files get read
-    original_read_text = Path.read_text
-    files_read = []
-
-    def tracking_read_text(self, *args, **kwargs):
-        files_read.append(str(self))
-        return original_read_text(self, *args, **kwargs)
-
-    # Run filter -- should only read URL_NEW's content, not the other two
-    args = make_args(main_db, output_db, content_dir)
-
-    import unittest.mock as mock
-    with mock.patch.object(Path, 'read_text', tracking_read_text):
-        # Will error on LLM call for URL_NEW, that's fine -- we only care about pass 1
-        try:
-            asyncio.run(filter(args))
-        except Exception:
-            pass
-
-    # Only URL_NEW should have been read from disk
-    content_reads = [f for f in files_read if "content" in f]
-    assert len(content_reads) == 1, f"Expected 1 file read, got {len(content_reads)}: {content_reads}"
-    assert "repo3" in content_reads[0], f"Expected repo3 file, got {content_reads[0]}"
+    return main_db
 
 
-def test_pass1_persists_frontmatter_failures(setup_dirs):
-    """Files without valid frontmatter should be stored in DB with has_frontmatter=0."""
-    main_db, output_db, content_dir = setup_dirs
-    init_output_db(output_db)
+def _args(main_db, output_db, content_dir, **kw):
+    return types.SimpleNamespace(
+        main_db=main_db, output_db=output_db, content_dir=content_dir,
+        model="test-model", base_url="http://localhost:1234/v1",
+        concurrency=1, backend="anthropic", **kw,
+    )
 
-    args = make_args(main_db, output_db, content_dir)
-    try:
-        asyncio.run(filter(args))
-    except Exception:
-        pass  # LLM calls will fail, that's fine
 
+def _db_rows(output_db, where="1=1"):
     conn = sqlite3.connect(output_db)
-    row = conn.execute(
-        "SELECT has_frontmatter, is_skill, reason FROM validation_results WHERE url = ?",
-        (URL_NO_FRONTMATTER,),
-    ).fetchone()
+    rows = conn.execute(f"SELECT url, has_frontmatter, is_skill, reason FROM validation_results WHERE {where}").fetchall()
     conn.close()
-
-    assert row is not None, "Frontmatter failure should be in DB"
-    assert row[0] == 0, f"has_frontmatter should be 0, got {row[0]}"
-    assert row[1] == 0, f"is_skill should be 0, got {row[1]}"
-    assert "frontmatter" in row[2].lower(), f"reason should mention frontmatter, got {row[2]}"
+    return rows
 
 
-def test_rerun_skips_frontmatter_failures(setup_dirs):
-    """Second run should skip URLs that failed frontmatter on the first run."""
-    main_db, output_db, content_dir = setup_dirs
-    init_output_db(output_db)
+# -- Unit tests: filter_pass1 --
 
-    args = make_args(main_db, output_db, content_dir)
+class TestPass1Unit:
+    """Unit tests for filter_pass1. Mocks: scan_content, has_valid_frontmatter, file I/O."""
 
-    # First run -- will check all files
-    try:
-        asyncio.run(filter(args))
-    except Exception:
-        pass
+    def test_skips_already_checked_urls(self, db_paths):
+        """URLs with has_frontmatter set should not trigger file reads."""
+        main_db, output_db = db_paths
 
-    # Second run -- track reads
-    original_read_text = Path.read_text
-    files_read = []
+        # Pre-populate DB
+        init_output_db(output_db)
+        conn = sqlite3.connect(output_db)
+        conn.execute(
+            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+            (URL_FM_NO,),
+        )
+        conn.execute(
+            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 1, 'Valid skill')",
+            (URL_FM_YES,),
+        )
+        conn.commit()
+        conn.close()
 
-    def tracking_read_text(self, *args, **kwargs):
-        files_read.append(str(self))
-        return original_read_text(self, *args, **kwargs)
+        mock_read = mock.MagicMock(return_value=VALID_SKILL)
 
-    import unittest.mock as mock
-    with mock.patch.object(Path, 'read_text', tracking_read_text):
-        try:
-            asyncio.run(filter(args))
-        except Exception:
-            pass
+        with mock.patch("github_skills_dataset.filter.filter.scan_content",
+                        return_value=([], [URL_FM_NO, URL_FM_YES, URL_NEW], 0)), \
+             mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db, Path("/fake"))
+            asyncio.run(filter_pass1(args))
 
-    content_reads = [f for f in files_read if "content" in f]
-    # URL_NO_FRONTMATTER should NOT be read again (already in DB as has_frontmatter=0)
-    no_fm_reads = [f for f in content_reads if "repo2" in f]
-    assert len(no_fm_reads) == 0, f"Frontmatter failure should not be re-read, but got: {no_fm_reads}"
+        # Only URL_NEW should have been read
+        assert mock_read.call_count == 1
+
+    def test_persists_frontmatter_failures(self, db_paths):
+        """Files without frontmatter get stored with has_frontmatter=0."""
+        main_db, output_db = db_paths
+
+        def fake_read(self, *a, **kw):
+            if "repo2" in str(self):
+                return NO_FRONTMATTER
+            return VALID_SKILL
+
+        with mock.patch("github_skills_dataset.filter.filter.scan_content",
+                        return_value=([], [URL_FM_NO, URL_FM_YES], 0)), \
+             mock.patch.object(Path, "read_text", fake_read):
+            args = _args(main_db, output_db, Path("/fake"))
+            asyncio.run(filter_pass1(args))
+
+        rows = _db_rows(output_db, "has_frontmatter = 0")
+        assert len(rows) == 1
+        assert rows[0][0] == URL_FM_NO
+        assert rows[0][3] == "No valid YAML frontmatter"
+
+    def test_does_not_write_llm_results(self, db_paths):
+        """Pass 1 should not write is_skill=1 for files with frontmatter."""
+        main_db, output_db = db_paths
+
+        with mock.patch("github_skills_dataset.filter.filter.scan_content",
+                        return_value=([], [URL_FM_YES], 0)), \
+             mock.patch.object(Path, "read_text", return_value=VALID_SKILL):
+            args = _args(main_db, output_db, Path("/fake"))
+            asyncio.run(filter_pass1(args))
+
+        # Files with frontmatter should NOT be in the DB (pass 2's job)
+        rows = _db_rows(output_db, "has_frontmatter = 1")
+        assert len(rows) == 0
+
+
+# -- Unit tests: filter_pass2 --
+
+class TestPass2Unit:
+    """Unit tests for filter_pass2. Mocks: scan_content, file I/O, LLM client."""
+
+    def test_skips_frontmatter_failures(self, db_paths):
+        """URLs marked has_frontmatter=0 should be skipped in pass 2."""
+        main_db, output_db = db_paths
+
+        init_output_db(output_db)
+        conn = sqlite3.connect(output_db)
+        conn.execute(
+            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+            (URL_FM_NO,),
+        )
+        conn.commit()
+        conn.close()
+
+        mock_read = mock.MagicMock(return_value=VALID_SKILL)
+
+        with mock.patch("github_skills_dataset.filter.filter.scan_content",
+                        return_value=([], [URL_FM_NO], 0)), \
+             mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db, Path("/fake"))
+            asyncio.run(filter_pass2(args))
+
+        # Should not have read any files -- all skipped
+        assert mock_read.call_count == 0
+
+    def test_skips_already_classified(self, db_paths):
+        """URLs with successful LLM results should be skipped."""
+        main_db, output_db = db_paths
+
+        init_output_db(output_db)
+        conn = sqlite3.connect(output_db)
+        conn.execute(
+            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 1, 'Valid skill')",
+            (URL_FM_YES,),
+        )
+        conn.commit()
+        conn.close()
+
+        mock_read = mock.MagicMock(return_value=VALID_SKILL)
+
+        with mock.patch("github_skills_dataset.filter.filter.scan_content",
+                        return_value=([], [URL_FM_YES], 0)), \
+             mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db, Path("/fake"))
+            asyncio.run(filter_pass2(args))
+
+        assert mock_read.call_count == 0
+
+    def test_retries_errors(self, db_paths):
+        """URLs with Error: reasons should be retried."""
+        main_db, output_db = db_paths
+
+        init_output_db(output_db)
+        conn = sqlite3.connect(output_db)
+        conn.execute(
+            "INSERT INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, 0, 'Error: 404')",
+            (URL_FM_YES,),
+        )
+        conn.commit()
+        conn.close()
+
+        mock_read = mock.MagicMock(return_value=VALID_SKILL)
+
+        with mock.patch("github_skills_dataset.filter.filter.scan_content",
+                        return_value=([], [URL_FM_YES], 0)), \
+             mock.patch.object(Path, "read_text", mock_read):
+            args = _args(main_db, output_db, Path("/fake"))
+            # Will fail on actual LLM call, that's fine
+            try:
+                asyncio.run(filter_pass2(args))
+            except Exception:
+                pass
+
+        # Should have read the file (not skipped)
+        assert mock_read.call_count == 1

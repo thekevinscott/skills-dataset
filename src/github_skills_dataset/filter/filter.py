@@ -41,8 +41,6 @@ def parse_response(text: str) -> dict:
     raise ValueError(f"Could not parse JSON: {text[:200]}")
 
 
-
-
 def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, path: str) -> Path:
     """Build path to local content file."""
     return content_dir / owner / repo / "blob" / ref / path
@@ -69,19 +67,12 @@ def init_output_db(output_db: Path):
     conn.close()
 
 
-
-async def filter(args):
-    """Main filter pipeline using Anthropic Message Batches API (50% discount)."""
-    init_output_db(args.output_db)
-    model = args.model or DEFAULT_MODEL
-    base_url = getattr(args, 'base_url', None)
-
-    # Get all URLs from source DB
+def scan_content(args):
+    """Scan source DB and content dir, return (all_urls, to_validate, no_content)."""
     main_conn = sqlite3.connect(args.main_db)
     all_urls = [row[0] for row in main_conn.execute("SELECT url FROM files").fetchall()]
     main_conn.close()
 
-    # Content on disk
     t_start = time.monotonic()
     content_paths = set()
     for dirpath, _, filenames in os.walk(args.content_dir):
@@ -105,29 +96,29 @@ async def filter(args):
     print(f"  Content on disk: {len(to_validate):,}")
     print(f"  Not yet fetched:  {no_content:,}")
 
-    # Load URLs already checked for frontmatter (pass 1 skip)
+    return all_urls, to_validate, no_content
+
+
+async def filter_pass1(args):
+    """Pass 1: check frontmatter and persist results to DB."""
+    init_output_db(args.output_db)
+    all_urls, to_validate, no_content = scan_content(args)
+
+    # Load URLs already checked for frontmatter (skip)
     out_conn = sqlite3.connect(args.output_db)
     already_checked = set()
     for row in out_conn.execute(
         "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL"
     ).fetchall():
         already_checked.add(row[0])
-    # Load successful LLM results (pass 2 skip)
-    llm_results = {}
-    for row in out_conn.execute(
-        "SELECT url, is_skill, reason FROM validation_results WHERE has_frontmatter = 1 AND reason NOT LIKE 'Error:%'"
-    ).fetchall():
-        llm_results[row[0]] = (row[1], row[2])
     out_conn.close()
 
-    local_results = []
     frontmatter_failures = []
-    uncached = {}            # cache_key -> (content, [urls])
     skipped_pass1 = 0
     no_frontmatter = 0
+    has_frontmatter_count = 0
     t_start = time.monotonic()
     for url in tqdm(to_validate, desc="Pass 1: frontmatter", unit="file"):
-        # Skip if frontmatter already checked
         if url in already_checked:
             skipped_pass1 += 1
             continue
@@ -138,6 +129,66 @@ async def filter(args):
         if not has_valid_frontmatter(content):
             no_frontmatter += 1
             frontmatter_failures.append(url)
+        else:
+            has_frontmatter_count += 1
+
+    t_pass1 = time.monotonic() - t_start
+    print(f"\nPass 1 - frontmatter check ({t_pass1:.1f}s):")
+    print(f"  Already checked: {skipped_pass1:,}")
+    print(f"  No valid frontmatter: {no_frontmatter:,}")
+    print(f"  Has frontmatter: {has_frontmatter_count:,}")
+
+    # Write frontmatter failures to DB
+    out_conn = sqlite3.connect(args.output_db)
+    for i, url in enumerate(frontmatter_failures):
+        out_conn.execute(
+            "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
+            (url,)
+        )
+        if (i + 1) % 1000 == 0:
+            out_conn.commit()
+    out_conn.commit()
+    out_conn.close()
+
+
+async def filter_pass2(args):
+    """Pass 2: classify files with valid frontmatter via LLM."""
+    init_output_db(args.output_db)
+    model = args.model or DEFAULT_MODEL
+    base_url = getattr(args, 'base_url', None)
+
+    all_urls, to_validate, no_content = scan_content(args)
+
+    # Load URLs already fully processed (pass 2 skip)
+    out_conn = sqlite3.connect(args.output_db)
+    already_done = set()
+    for row in out_conn.execute(
+        "SELECT url FROM validation_results WHERE has_frontmatter = 1 AND reason NOT LIKE 'Error:%'"
+    ).fetchall():
+        already_done.add(row[0])
+    # Also skip frontmatter failures
+    for row in out_conn.execute(
+        "SELECT url FROM validation_results WHERE has_frontmatter = 0"
+    ).fetchall():
+        already_done.add(row[0])
+    out_conn.close()
+
+    local_results = []
+    uncached = {}  # cache_key -> (content, [urls])
+    skipped = 0
+    no_frontmatter = 0
+    t_start = time.monotonic()
+    for url in tqdm(to_validate, desc="Pass 2: prep", unit="file"):
+        if url in already_done:
+            skipped += 1
+            continue
+        parsed = parse_github_url(url)
+        owner, repo, ref, path = parsed
+        local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
+        content = local_path.read_text(errors='replace')
+        if not has_valid_frontmatter(content):
+            # Shouldn't happen if pass 1 ran, but handle gracefully
+            no_frontmatter += 1
             continue
         prompt = VALIDATION_PROMPT.format(content=content)
         cache_key = make_cache_key(prompt, model, base_url)
@@ -154,28 +205,16 @@ async def filter(args):
         else:
             uncached[cache_key] = (content, [url])
 
-    total_uncached = 0
-    for k in uncached.keys():
-        _, urls = uncached[k]
-        total_uncached += len(urls)
+    total_uncached = sum(len(urls) for _, urls in uncached.values())
 
-    t_pass1 = time.monotonic() - t_start
-    print(f"\nPass 1 - frontmatter check ({t_pass1:.1f}s):")
-    print(f"  Already checked: {skipped_pass1:,}")
-    print(f"  No valid frontmatter: {no_frontmatter:,}")
-    print(f"Pass 2 - LLM classification:")
+    t_prep = time.monotonic() - t_start
+    print(f"\nPass 2 - LLM classification ({t_prep:.1f}s prep):")
+    print(f"  Already done: {skipped:,}")
     print(f"  Cached (no API call): {len(local_results):,}")
     print(f"  Need LLM call: {total_uncached:,}")
 
-    # Write frontmatter failures and cached results to DB
+    # Write cached results to DB
     out_conn = sqlite3.connect(args.output_db)
-    for i, url in enumerate(frontmatter_failures):
-        out_conn.execute(
-            "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 0, 0, 'No valid YAML frontmatter')",
-            (url,)
-        )
-        if (i + 1) % 1000 == 0:
-            out_conn.commit()
     for url, is_skill, reason in local_results:
         out_conn.execute(
             "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
@@ -191,7 +230,7 @@ async def filter(args):
         print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
         return
 
-    # --- Phase 2: Concurrent API calls ---
+    # --- Concurrent API calls ---
     concurrency = getattr(args, 'concurrency', DEFAULT_CONCURRENCY)
     backend = getattr(args, 'backend', 'anthropic')
     semaphore = asyncio.Semaphore(concurrency)
@@ -258,7 +297,7 @@ async def filter(args):
             except Exception as e:
                 last_error = e
                 if attempt < 2:
-                    await asyncio.sleep(2 * (attempt + 1))  # Longer backoff: 2s, 4s
+                    await asyncio.sleep(2 * (attempt + 1))
         return cache_key, urls, False, f"Error: {str(last_error)[:80]}", last_error
 
     # Launch all tasks - semaphore controls concurrency
@@ -280,7 +319,6 @@ async def filter(args):
         if error:
             error_count += 1
         else:
-            # Only cache successful results, not errors
             entry_cache = llm_cache / f"{cache_key}.json"
             await async_write_cache(entry_cache, {"is_skill": is_skill, "reason": reason})
 
@@ -296,7 +334,6 @@ async def filter(args):
 
         bar.set_postfix(valid=valid_count, rejected=invalid_count, errors=error_count)
 
-        # Commit every 100
         if completed % 100 == 0:
             out_conn.commit()
 
@@ -309,3 +346,9 @@ async def filter(args):
     final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
     conn.close()
     print(f"\nOutput DB: {args.output_db} ({final_valid:,} valid skill files)")
+
+
+async def filter(args):
+    """Run both passes in sequence."""
+    await filter_pass1(args)
+    await filter_pass2(args)
