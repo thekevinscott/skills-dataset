@@ -7,7 +7,6 @@ import re
 import sqlite3
 from pathlib import Path
 
-import anthropic
 import httpx
 from .config import CACHE_DIR, DEFAULT_MODEL, VALIDATION_PROMPT
 
@@ -162,24 +161,49 @@ async def filter(args):
     # --- Phase 2: Concurrent API calls ---
     base_url = getattr(args, 'base_url', None)
     concurrency = getattr(args, 'concurrency', DEFAULT_CONCURRENCY)
-    client_kwargs = {}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-        # Dummy key required by SDK even for local endpoints
-        client_kwargs["api_key"] = "sk-ant-dummy-key-for-local-endpoint"
-    client = anthropic.AsyncAnthropic(**client_kwargs)
+    backend = getattr(args, 'backend', 'anthropic')
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def validate_one(cache_key, content):
-        async with semaphore:
-            prompt = VALIDATION_PROMPT.format(content=content)
-            message = await client.messages.create(
-                model=model,
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = message.content[0].text
-            return parse_response(text)
+    if backend == 'claude-agent-sdk':
+        try:
+            from claude_agent_sdk import ClaudeAgentOptions, AssistantMessage, TextBlock, ResultMessage, query as agent_query
+        except ImportError:
+            raise ImportError("claude-agent-sdk not installed. Install with: uv add claude-agent-sdk")
+
+        async def validate_one(cache_key, content):
+            async with semaphore:
+                prompt = VALIDATION_PROMPT.format(content=content)
+                text = ""
+                opts = ClaudeAgentOptions(max_turns=1)
+                async for message in agent_query(prompt=prompt, options=opts):
+                    if isinstance(message, ResultMessage) and message.is_error:
+                        raise Exception(message.result)
+                    if not isinstance(message, AssistantMessage):
+                        continue
+                    if not hasattr(message, "content"):
+                        continue
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text += block.text
+                return parse_response(text.strip())
+    else:
+        import anthropic
+        client_kwargs = {}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+            client_kwargs["api_key"] = "sk-ant-dummy-key-for-local-endpoint"
+        client = anthropic.AsyncAnthropic(**client_kwargs)
+
+        async def validate_one(cache_key, content):
+            async with semaphore:
+                prompt = VALIDATION_PROMPT.format(content=content)
+                message = await client.messages.create(
+                    model=model,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = message.content[0].text
+                return parse_response(text)
 
     unique_items = list(uncached.items())
     out_conn = sqlite3.connect(args.output_db)

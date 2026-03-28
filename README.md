@@ -4,7 +4,7 @@ Build a SKILL.md dataset from GitHub for Kaggle upload.
 
 ## Prerequisites
 
-- An Anthropic API key (`ANTHROPIC_API_KEY` env var) for the `filter-valid-skills` command
+- An Anthropic API key (`ANTHROPIC_API_KEY` env var) for the `filter-valid-skills` command (or `claude-agent-sdk` for subscription billing)
 - A GitHub token in `.env` (`GITHUB_TOKEN=...`)
 
 ## Installation
@@ -26,8 +26,12 @@ uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
 
 ```bash
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
-  github-fetch fetch-file-content --db data/skills.db --content-dir data/content
+  github-fetch fetch-file-content --db data/skills.db --content-dir data/content --graphql
 ```
+
+The `--graphql` flag batches 50 files per query and is ~50x faster than the
+default REST path. Omit it to fall back to REST (10 concurrent threads, ~1.3
+req/s throttled).
 
 ### 3. Filter valid skills
 
@@ -39,7 +43,16 @@ files with content on disk are processed; the rest are skipped until fetched.
 Content is truncated to 3 KB for classification (frontmatter + intro is enough).
 
 ```bash
-# Using Anthropic API (default model: claude-haiku-4-5-20251001)
+# Using Claude Agent SDK (subscription billing, no per-token cost)
+uvx --from 'github-skills-dataset[agent] @ git+https://github.com/thekevinscott/skills-dataset' \
+  skills-dataset filter-valid-skills \
+  --main-db data/skills.db \
+  --output-db data/validated.db \
+  --content-dir data/content \
+  --backend claude-agent-sdk \
+  --concurrency 3
+
+# Using Anthropic API (per-token billing, default model: claude-haiku-4-5-20251001)
 uvx --from git+https://github.com/thekevinscott/skills-dataset \
   skills-dataset filter-valid-skills \
   --main-db data/skills.db \
@@ -56,7 +69,7 @@ uvx --from git+https://github.com/thekevinscott/skills-dataset \
   --model qwen2.5:14b
 ```
 
-Options: `--model`, `--base-url`
+Options: `--model`, `--base-url`, `--backend`, `--concurrency`
 
 ### 4. Fetch metadata and history
 

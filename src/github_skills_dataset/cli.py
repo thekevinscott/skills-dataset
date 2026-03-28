@@ -50,8 +50,14 @@ def cli():
     type=int,
     help="Number of concurrent API requests (default: 10, use 1 for sequential)",
 )
-def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concurrency):
-    """Filter SKILL.md files using Claude Message Batches API (50% discount)."""
+@click.option(
+    "--backend",
+    type=click.Choice(["anthropic", "claude-agent-sdk"]),
+    default="anthropic",
+    help="API backend: 'anthropic' for per-token billing, 'claude-agent-sdk' for subscription billing",
+)
+def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concurrency, backend):
+    """Filter SKILL.md files using an LLM for classification."""
     from .filter import filter
 
     class Args:
@@ -64,6 +70,7 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concur
     args.model = model
     args.base_url = base_url
     args.concurrency = concurrency
+    args.backend = backend
 
     asyncio.run(filter(args))
 
