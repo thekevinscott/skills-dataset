@@ -1,34 +1,27 @@
 """Filter valid SKILL.md files using an LLM API."""
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 
-import httpx
-from .config import CACHE_DIR, DEFAULT_MODEL, VALIDATION_PROMPT
+from cachetta import async_read_cache, async_write_cache
+from .config import DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
 
 DEFAULT_CONCURRENCY = 10
 from .parse_github_url import parse_github_url
 from .has_valid_frontmatter import has_valid_frontmatter
-from .prompt_hash import prompt_hash
 from .truncate_content import truncate_content
 
 
-def get_cached_result(content_hash: str) -> dict | None:
-    """Check file cache for a previous result."""
-    cache_file = CACHE_DIR / f"{content_hash}.json"
-    if cache_file.exists():
-        return json.loads(cache_file.read_text())
-    return None
-
-
-def insert_cached_result(content_hash: str, is_skill: bool, reason: str):
-    """Store result in file cache."""
-    cache_file = CACHE_DIR / f"{content_hash}.json"
-    cache_file.write_text(json.dumps({"is_skill": is_skill, "reason": reason}))
+def make_cache_key(prompt: str, model: str, base_url: str | None) -> str:
+    """Hash prompt + model + base_url into a cache filename."""
+    key_data = json.dumps({"prompt": prompt, "model": model, "base_url": base_url}, sort_keys=True)
+    return hashlib.sha256(key_data.encode()).hexdigest()
 
 
 def parse_response(text: str) -> dict:
@@ -72,9 +65,9 @@ def init_output_db(output_db: Path):
 
 async def filter(args):
     """Main filter pipeline using Anthropic Message Batches API (50% discount)."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     init_output_db(args.output_db)
     model = args.model or DEFAULT_MODEL
+    base_url = getattr(args, 'base_url', None)
 
     # Get all URLs from source DB
     main_conn = sqlite3.connect(args.main_db)
@@ -82,6 +75,7 @@ async def filter(args):
     main_conn.close()
 
     # Content on disk
+    t_start = time.monotonic()
     content_paths = set()
     for dirpath, _, filenames in os.walk(args.content_dir):
         for fname in filenames:
@@ -99,7 +93,10 @@ async def filter(args):
         else:
             no_content += 1
 
-    print(f"Total: {len(all_urls):,}, Content available: {len(to_validate):,}, No content yet: {no_content:,}")
+    t_scan = time.monotonic() - t_start
+    print(f"URLs in DB: {len(all_urls):,} (scan: {t_scan:.1f}s)")
+    print(f"  Content on disk: {len(to_validate):,}")
+    print(f"  Not yet fetched:  {no_content:,}")
 
     # Load existing results from output DB (skip URLs already processed without errors)
     out_conn = sqlite3.connect(args.output_db)
@@ -113,6 +110,8 @@ async def filter(args):
     local_results = []
     uncached = {}            # cache_key -> (content, [urls])
     skipped_db = 0
+    no_frontmatter = 0
+    t_start = time.monotonic()
     for url in to_validate:
         # Skip if already in DB with valid result
         if url in existing_results:
@@ -122,24 +121,36 @@ async def filter(args):
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
         content = local_path.read_text(errors='replace')
-        if has_valid_frontmatter(content):
-            cache_key = prompt_hash(content)
+        if not has_valid_frontmatter(content):
+            no_frontmatter += 1
+            continue
+        prompt = VALIDATION_PROMPT.format(content=content)
+        cache_key = make_cache_key(prompt, model, base_url)
+        entry_cache = llm_cache / f"{cache_key}.json"
 
-            cached = get_cached_result(cache_key)
+        async with async_read_cache(entry_cache) as cached:
             if cached is not None:
                 local_results.append((url, cached["is_skill"], cached.get("reason", "")))
-            else:
-                # Deduplicate by content -- same content across repos only needs one API call
-                if cache_key in uncached:
-                    uncached[cache_key][1].append(url)
-                else:
-                    uncached[cache_key] = (content, [url])
+                continue
+
+        # Deduplicate by content -- same content across repos only needs one API call
+        if cache_key in uncached:
+            uncached[cache_key][1].append(url)
+        else:
+            uncached[cache_key] = (content, [url])
 
     total_uncached = 0
     for k in uncached.keys():
         _, urls = uncached[k]
         total_uncached += len(urls)
-    print(f'Already in DB: {skipped_db:,}, cached: {len(local_results):,}, uncached: {total_uncached:,}')
+
+    t_pass1 = time.monotonic() - t_start
+    print(f"\nPass 1 - frontmatter check ({t_pass1:.1f}s):")
+    print(f"  Already validated: {skipped_db:,}")
+    print(f"  No valid frontmatter: {no_frontmatter:,}")
+    print(f"Pass 2 - LLM classification:")
+    print(f"  Cached (no API call): {len(local_results):,}")
+    print(f"  Need LLM call: {total_uncached:,}")
 
     # Write cached/frontmatter-rejected results to DB
     out_conn = sqlite3.connect(args.output_db)
@@ -159,7 +170,6 @@ async def filter(args):
         return
 
     # --- Phase 2: Concurrent API calls ---
-    base_url = getattr(args, 'base_url', None)
     concurrency = getattr(args, 'concurrency', DEFAULT_CONCURRENCY)
     backend = getattr(args, 'backend', 'anthropic')
     semaphore = asyncio.Semaphore(concurrency)
@@ -235,6 +245,7 @@ async def filter(args):
         for cache_key, (content, urls) in unique_items
     ]
 
+    t_start = time.monotonic()
     print(f"\nProcessing {total:,} unique files (concurrency: {concurrency})...")
 
     for coro in asyncio.as_completed(tasks):
@@ -249,7 +260,8 @@ async def filter(args):
             error_count += 1
         else:
             # Only cache successful results, not errors
-            insert_cached_result(cache_key, is_skill, reason)
+            entry_cache = llm_cache / f"{cache_key}.json"
+            await async_write_cache(entry_cache, {"is_skill": is_skill, "reason": reason})
 
         for url in urls:
             out_conn.execute(
@@ -270,7 +282,8 @@ async def filter(args):
 
     out_conn.commit()
     out_conn.close()
-    print(f"\nDone: {completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
+    t_pass2 = time.monotonic() - t_start
+    print(f"\nDone in {t_pass2:.1f}s: {completed:,}/{total:,} - valid: {valid_count:,}, rejected: {invalid_count:,}, errors: {error_count:,}")
 
     conn = sqlite3.connect(args.output_db)
     final_valid = conn.execute("SELECT COUNT(*) FROM validation_results WHERE is_skill = 1").fetchone()[0]
