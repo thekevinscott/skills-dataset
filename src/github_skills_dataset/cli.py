@@ -34,9 +34,9 @@ _filter_llm_options = [
                  help="Base URL for API proxy (e.g. http://localhost:11434/v1)"),
     click.option("--concurrency", default=10, type=int,
                  help="Number of concurrent API requests (default: 10)"),
-    click.option("--backend", type=click.Choice(["anthropic", "claude-agent-sdk"]),
+    click.option("--backend", type=click.Choice(["anthropic", "openai", "claude-agent-sdk"]),
                  default="anthropic",
-                 help="API backend: 'anthropic' for per-token billing, 'claude-agent-sdk' for subscription billing"),
+                 help="API backend: 'anthropic' (default), 'openai' (for Ollama/local), 'claude-agent-sdk' (subscription)"),
 ]
 
 

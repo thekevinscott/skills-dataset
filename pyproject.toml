@@ -12,6 +12,8 @@ dependencies = [
     "click>=8.0.0",
     "python-dotenv>=1.0.0",
     "tqdm>=4.67.3",
+    "claude-agent-sdk>=0.1.50",
+    "openai>=2.29.0",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,11 @@ skills-dataset = "github_skills_dataset.cli:cli"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+markers = [
+    "e2e: end-to-end tests hitting real LLM endpoints",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/github_skills_dataset"]

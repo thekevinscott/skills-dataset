@@ -293,6 +293,24 @@ async def filter_pass2(args, to_validate=None):
                         if isinstance(block, TextBlock):
                             text += block.text
                 return parse_response(text.strip())
+    elif backend == 'openai':
+        from openai import AsyncOpenAI
+        client_kwargs = {}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client_kwargs["api_key"] = os.environ.get("OPENAI_API_KEY", "dummy")
+        client = AsyncOpenAI(**client_kwargs)
+
+        async def validate_one(cache_key, content):
+            async with semaphore:
+                prompt = VALIDATION_PROMPT.format(content=content)
+                response = await client.chat.completions.create(
+                    model=model,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = response.choices[0].message.content
+                return parse_response(text)
     else:
         import anthropic
         client_kwargs = {}

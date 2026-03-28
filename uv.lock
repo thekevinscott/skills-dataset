@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.12"
 
 [options]
-exclude-newer = "2026-03-25T15:17:04.655365649Z"
+exclude-newer = "2026-03-25T20:19:01.269013435Z"
 exclude-newer-span = "P3D"
 
 [[package]]
@@ -247,7 +247,9 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "cachetta" },
+    { name = "claude-agent-sdk" },
     { name = "click" },
+    { name = "openai" },
     { name = "polars" },
     { name = "pyarrow" },
     { name = "python-dotenv" },
@@ -268,8 +270,10 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40.0" },
     { name = "cachetta", specifier = ">=0.6.0" },
+    { name = "claude-agent-sdk", specifier = ">=0.1.50" },
     { name = "claude-agent-sdk", marker = "extra == 'agent'" },
     { name = "click", specifier = ">=8.0.0" },
+    { name = "openai", specifier = ">=2.29.0" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "pyarrow", specifier = ">=15.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
@@ -462,6 +466,25 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/fc/6d/62e76bbb8144d6ed86e202b5edd8a4cb631e7c8130f3f4893c3f90262b10/mcp-1.26.0.tar.gz", hash = "sha256:db6e2ef491eecc1a0d93711a76f28dec2e05999f93afd48795da1c1137142c66", size = 608005, upload-time = "2026-01-24T19:40:32.468Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fd/d9/eaa1f80170d2b7c5ba23f3b59f766f3a0bb41155fbc32a69adfa1adaaef9/mcp-1.26.0-py3-none-any.whl", hash = "sha256:904a21c33c25aa98ddbeb47273033c435e595bbacfdb177f4bd87f6dceebe1ca", size = 233615, upload-time = "2026-01-24T19:40:30.652Z" },
+]
+
+[[package]]
+name = "openai"
+version = "2.29.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b4/15/203d537e58986b5673e7f232453a2a2f110f22757b15921cbdeea392e520/openai-2.29.0.tar.gz", hash = "sha256:32d09eb2f661b38d3edd7d7e1a2943d1633f572596febe64c0cd370c86d52bec", size = 671128, upload-time = "2026-03-17T17:53:49.599Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d0/b1/35b6f9c8cf9318e3dbb7146cc82dab4cf61182a8d5406fc9b50864362895/openai-2.29.0-py3-none-any.whl", hash = "sha256:b7c5de513c3286d17c5e29b92c4c98ceaf0d775244ac8159aeb1bddf840eb42a", size = 1141533, upload-time = "2026-03-17T17:53:47.348Z" },
 ]
 
 [[package]]
