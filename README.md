@@ -37,7 +37,7 @@ req/s throttled).
 
 Two-pass filter: rejects files without valid YAML frontmatter (free), then
 classifies remaining files via an LLM. Results are cached on disk
-(`~/.cache/skills-dataset/claude/`) so re-runs only pay for new files. Only
+(`~/.cache/skills-dataset/llm/`) so re-runs only pay for new files. Only
 files with content on disk are processed; the rest are skipped until fetched.
 
 Content is truncated to 3 KB for classification (frontmatter + intro is enough).
@@ -94,24 +94,4 @@ uvx --from git+https://github.com/thekevinscott/skills-dataset \
 
 ```bash
 cd build && kaggle datasets create -p . --dir-mode tar
-```
-
-## Project Structure
-
-```
-skills-dataset/
-  src/github_skills_dataset/
-    cli.py               # Click CLI
-    filter/              # Two-pass validation (frontmatter + LLM)
-      filter.py          # Main pipeline
-      config.py          # Constants (model, cache dir, prompt)
-      has_valid_frontmatter.py
-      parse_github_url.py
-      prompt_hash.py     # Cache key generation
-      truncate_content.py
-      validation_prompt.txt
-    export.py            # Parquet export
-    kaggle_metadata.py   # Kaggle dataset-metadata.json generation
-  pyproject.toml
-  README.md
 ```
