@@ -105,25 +105,31 @@ async def filter(args):
     print(f"  Content on disk: {len(to_validate):,}")
     print(f"  Not yet fetched:  {no_content:,}")
 
-    # Load existing results from output DB (skip URLs already processed without errors)
+    # Load URLs already checked for frontmatter (pass 1 skip)
     out_conn = sqlite3.connect(args.output_db)
-    existing_results = {}
+    already_checked = set()
     for row in out_conn.execute(
-        "SELECT url, is_skill, reason FROM validation_results WHERE reason NOT LIKE 'Error:%'"
+        "SELECT url FROM validation_results WHERE has_frontmatter IS NOT NULL"
     ).fetchall():
-        existing_results[row[0]] = (row[1], row[2])
+        already_checked.add(row[0])
+    # Load successful LLM results (pass 2 skip)
+    llm_results = {}
+    for row in out_conn.execute(
+        "SELECT url, is_skill, reason FROM validation_results WHERE has_frontmatter = 1 AND reason NOT LIKE 'Error:%'"
+    ).fetchall():
+        llm_results[row[0]] = (row[1], row[2])
     out_conn.close()
 
     local_results = []
     frontmatter_failures = []
     uncached = {}            # cache_key -> (content, [urls])
-    skipped_db = 0
+    skipped_pass1 = 0
     no_frontmatter = 0
     t_start = time.monotonic()
     for url in tqdm(to_validate, desc="Pass 1: frontmatter", unit="file"):
-        # Skip if already in DB with valid result
-        if url in existing_results:
-            skipped_db += 1
+        # Skip if frontmatter already checked
+        if url in already_checked:
+            skipped_pass1 += 1
             continue
         parsed = parse_github_url(url)
         owner, repo, ref, path = parsed
@@ -155,7 +161,7 @@ async def filter(args):
 
     t_pass1 = time.monotonic() - t_start
     print(f"\nPass 1 - frontmatter check ({t_pass1:.1f}s):")
-    print(f"  Already validated: {skipped_db:,}")
+    print(f"  Already checked: {skipped_pass1:,}")
     print(f"  No valid frontmatter: {no_frontmatter:,}")
     print(f"Pass 2 - LLM classification:")
     print(f"  Cached (no API call): {len(local_results):,}")
