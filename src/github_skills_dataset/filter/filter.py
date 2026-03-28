@@ -91,6 +91,20 @@ def init_output_db(output_db: Path):
             );
         """)
 
+    # Multi-model evaluation table
+    conn = sqlite3.connect(output_db)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_skill_evaluation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            model TEXT NOT NULL,
+            is_skill BOOLEAN NOT NULL,
+            reason TEXT,
+            evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(url, backend, model)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -192,6 +206,7 @@ async def filter_pass2(args, to_validate=None):
     init_output_db(args.output_db)
     model = args.model or DEFAULT_MODEL
     base_url = getattr(args, 'base_url', None)
+    backend = getattr(args, 'backend', 'anthropic')
 
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
@@ -256,6 +271,10 @@ async def filter_pass2(args, to_validate=None):
             "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
             (url, is_skill, reason)
         )
+        out_conn.execute(
+            "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, ?, ?, ?, ?)",
+            (url, backend, model, is_skill, reason)
+        )
     out_conn.commit()
     out_conn.close()
 
@@ -268,7 +287,6 @@ async def filter_pass2(args, to_validate=None):
 
     # --- Concurrent API calls ---
     concurrency = getattr(args, 'concurrency', DEFAULT_CONCURRENCY)
-    backend = getattr(args, 'backend', 'anthropic')
     semaphore = asyncio.Semaphore(concurrency)
 
     if backend == 'claude-agent-sdk':
@@ -380,6 +398,10 @@ async def filter_pass2(args, to_validate=None):
             out_conn.execute(
                 "INSERT OR REPLACE INTO validation_results (url, has_frontmatter, is_skill, reason) VALUES (?, 1, ?, ?)",
                 (url, is_skill, reason)
+            )
+            out_conn.execute(
+                "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, is_skill, reason) VALUES (?, ?, ?, ?, ?)",
+                (url, backend, model, is_skill, reason)
             )
             if is_skill:
                 valid_count += 1
