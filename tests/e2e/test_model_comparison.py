@@ -1,7 +1,7 @@
 """E2E tests comparing local Ollama models against Claude ground truth.
 
-Runs each model against 80 real SKILL.md files (40 valid, 40 rejected as
-classified by Claude) and reports agreement rates.
+Runs each model against 112 real SKILL.md files (56 valid, 56 rejected as
+classified by Claude) from the validation set and reports agreement rates.
 
 Requires:
   - Ollama running at OLLAMA_URL with tested models pulled
@@ -23,7 +23,7 @@ from github_skills_dataset.filter.filter import (
 )
 from github_skills_dataset.filter.parse_github_url import parse_github_url
 
-from .fixtures import FIXTURES
+from .fixtures_val import FIXTURES
 
 OLLAMA_URL = "http://tower.tail790bbc.ts.net:11434/v1"
 
