@@ -1,10 +1,10 @@
 """E2E tests comparing local Ollama models against Claude ground truth.
 
-Runs each model against 16 real SKILL.md files (10 valid, 6 rejected as
+Runs each model against 80 real SKILL.md files (40 valid, 40 rejected as
 classified by Claude) and reports agreement rates.
 
 Requires:
-  - Ollama running at OLLAMA_URL with all tested models pulled
+  - Ollama running at OLLAMA_URL with tested models pulled
   - ANTHROPIC_API_KEY set for claude-agent-sdk baseline
 """
 
@@ -73,7 +73,7 @@ def _setup_env(tmp_path, fixtures):
 
 
 def _classify(env, backend, model=None, base_url=None):
-    """Run pass 1 + pass 2, return {url: is_skill} dict."""
+    """Run pass 1 + pass 2, return {url: (is_skill, reason)} dict."""
     args = types.SimpleNamespace(
         main_db=env.main_db, output_db=env.output_db, content_dir=env.content_dir,
         model=model, base_url=base_url, concurrency=2, backend=backend, limit=None,
@@ -90,25 +90,71 @@ def _classify(env, backend, model=None, base_url=None):
 
 
 def _score(results, fixtures, urls):
-    """Compare model results against ground truth. Returns (correct, total, details)."""
-    correct = 0
-    total = len(fixtures)
+    """Compare model results against ground truth.
+
+    Returns dict with accuracy, precision, recall, and per-fixture details.
+    """
+    tp = fp = tn = fn = 0
     details = []
     for i, (content, expected) in enumerate(fixtures):
         url = urls[i]
         if url not in results:
             details.append({"idx": i, "expected": expected, "got": None, "match": False, "reason": "not classified"})
+            if expected:
+                fn += 1
+            else:
+                tn += 1  # not classified = not a skill
             continue
         got_skill, reason = results[url]
         got = bool(got_skill)
         match = got == expected
-        if match:
-            correct += 1
         details.append({
             "idx": i, "expected": expected, "got": got, "match": match,
             "reason": (reason or "")[:80],
         })
-    return correct, total, details
+        if got and expected:
+            tp += 1
+        elif got and not expected:
+            fp += 1
+        elif not got and expected:
+            fn += 1
+        else:
+            tn += 1
+
+    total = len(fixtures)
+    correct = tp + tn
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    return {
+        "correct": correct,
+        "total": total,
+        "accuracy": correct / total,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "details": details,
+    }
+
+
+def _print_report(model_name, score):
+    """Print a formatted report for one model."""
+    s = score
+    print(f"\n{'='*60}")
+    print(f"MODEL: {model_name}")
+    print(f"Accuracy:  {s['correct']}/{s['total']} ({100*s['accuracy']:.0f}%)")
+    print(f"Precision: {100*s['precision']:.0f}%  Recall: {100*s['recall']:.0f}%  F1: {100*s['f1']:.0f}%")
+    print(f"TP={s['tp']}  FP={s['fp']}  TN={s['tn']}  FN={s['fn']}")
+    mismatches = [d for d in s["details"] if not d["match"]]
+    if mismatches:
+        print(f"Mismatches ({len(mismatches)}):")
+        for d in mismatches:
+            label = "VALID" if d["expected"] else "REJECT"
+            got_label = "VALID" if d["got"] else "REJECT"
+            print(f"  [{label}->{got_label}] fixture {d['idx']}: {d['reason']}")
+    print(f"{'='*60}")
 
 
 @pytest.mark.e2e
@@ -119,42 +165,25 @@ class TestModelComparison:
         """Claude agent SDK should match its own ground truth labels."""
         env = _setup_env(tmp_path, FIXTURES)
         results = _classify(env, backend="claude-agent-sdk")
-        correct, total, details = _score(results, FIXTURES, env.urls)
-
-        for d in details:
-            if not d["match"]:
-                label = "VALID" if d["expected"] else "REJECT"
-                got_label = "VALID" if d["got"] else "REJECT"
-                print(f"  MISMATCH [{label}->{ got_label}] fixture {d['idx']}: {d['reason']}")
+        score = _score(results, FIXTURES, env.urls)
+        _print_report("claude-agent-sdk (baseline)", score)
 
         # Claude should agree with itself on most (allow some variance from non-determinism)
-        assert correct >= total - 2, f"Claude baseline: {correct}/{total} match"
+        assert score["correct"] >= score["total"] - 4, \
+            f"Claude baseline: {score['correct']}/{score['total']} match"
 
     @pytest.mark.parametrize("model", OLLAMA_MODELS)
     def test_ollama_model(self, tmp_path, model):
         """Test an Ollama model against Claude ground truth and report accuracy."""
         env = _setup_env(tmp_path, FIXTURES)
         results = _classify(env, backend="openai", model=model, base_url=OLLAMA_URL)
-        correct, total, details = _score(results, FIXTURES, env.urls)
-
-        mismatches = [d for d in details if not d["match"]]
-        print(f"\n{'='*60}")
-        print(f"MODEL: {model}")
-        print(f"Agreement with Claude: {correct}/{total} ({100*correct/total:.0f}%)")
-        if mismatches:
-            print(f"Mismatches:")
-            for d in mismatches:
-                label = "VALID" if d["expected"] else "REJECT"
-                got_label = "VALID" if d["got"] else "REJECT"
-                print(f"  [{label}->{got_label}] fixture {d['idx']}: {d['reason']}")
-        print(f"{'='*60}")
+        score = _score(results, FIXTURES, env.urls)
+        _print_report(model, score)
 
         # Write results to /tmp for post-hoc analysis
         report_path = Path(f"/tmp/e2e_model_{model.replace(':', '_').replace('/', '_')}.json")
         report_path.write_text(json.dumps({
             "model": model,
-            "correct": correct,
-            "total": total,
-            "accuracy": correct / total,
-            "details": details,
+            **{k: v for k, v in score.items() if k != "details"},
+            "details": score["details"],
         }, indent=2))
