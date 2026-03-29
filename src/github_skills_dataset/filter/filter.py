@@ -281,7 +281,7 @@ async def filter_pass2(args, to_validate=None):
             async with semaphore:
                 prompt = VALIDATION_PROMPT.format(content=content)
                 text = ""
-                opts = ClaudeAgentOptions(max_turns=1)
+                opts = ClaudeAgentOptions(max_turns=1, model=model)
                 async for message in agent_query(prompt=prompt, options=opts):
                     if isinstance(message, ResultMessage) and message.is_error:
                         raise Exception(message.result)
