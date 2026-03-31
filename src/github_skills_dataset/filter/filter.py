@@ -79,7 +79,29 @@ def init_output_db(output_db: Path):
             )
         """)
 
-    # --- llm_skill_evaluation: pass 2 (LLM classification) ---
+    # --- validation_results: add pass 2-4 columns ---
+    vr_cols = {row[1] for row in conn.execute("PRAGMA table_info(validation_results)")}
+    for col, typedef in [
+        ("heuristic_reject", "BOOLEAN"),
+        ("heuristic_reason", "TEXT"),
+        ("embedding_is_skill", "BOOLEAN"),
+        ("embedding_confidence", "REAL"),
+    ]:
+        if col not in vr_cols:
+            conn.execute(f"ALTER TABLE validation_results ADD COLUMN {col} {typedef}")
+
+    # --- embeddings: pass 3 (vector cache) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS embeddings (
+            content_hash TEXT NOT NULL,
+            model TEXT NOT NULL,
+            vector BLOB NOT NULL,
+            embedded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (content_hash, model)
+        )
+    """)
+
+    # --- llm_skill_evaluation: pass 5 (LLM classification) ---
     eval_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='llm_skill_evaluation'"
     ).fetchone()
@@ -190,25 +212,39 @@ async def filter_pass1(args, to_validate=None):
 
 
 async def filter_pass2(args, to_validate=None):
-    """Pass 2: classify files with valid frontmatter via LLM."""
+    """Pass 5 (LLM): classify files via LLM. Optionally filtered by confidence threshold."""
     init_output_db(args.output_db)
     model = args.model or DEFAULT_MODEL
     base_url = getattr(args, 'base_url', None)
     backend = getattr(args, 'backend', 'anthropic')
+    confidence_threshold = getattr(args, 'confidence_threshold', None)
 
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
-    # Only skip frontmatter failures (from pass 1 DB). LLM skip is handled by file cache.
+    # Skip: frontmatter failures, heuristic rejects, confident embeddings
     out_conn = sqlite3.connect(args.output_db)
-    no_frontmatter = set(
-        row[0] for row in out_conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter = 0"
-        ).fetchall()
-    )
+    skip_urls = set()
+
+    # Frontmatter failures
+    for row in out_conn.execute("SELECT url FROM validation_results WHERE has_frontmatter = 0"):
+        skip_urls.add(row[0])
+
+    # Heuristic rejects
+    for row in out_conn.execute("SELECT url FROM validation_results WHERE heuristic_reject = 1"):
+        skip_urls.add(row[0])
+
+    # Confident embedding predictions (above threshold)
+    if confidence_threshold is not None:
+        for row in out_conn.execute(
+            "SELECT url FROM validation_results WHERE embedding_confidence >= ?",
+            (confidence_threshold,)
+        ):
+            skip_urls.add(row[0])
+
     out_conn.close()
 
-    to_classify = [url for url in to_validate if url not in no_frontmatter]
+    to_classify = [url for url in to_validate if url not in skip_urls]
     skipped = len(to_validate) - len(to_classify)
 
     limit = getattr(args, 'limit', None)
