@@ -14,7 +14,8 @@ def parse_frontmatter(content: str) -> dict:
     if not match:
         return {}
     try:
-        return yaml.safe_load(match.group(1)) or {}
+        result = yaml.safe_load(match.group(1))
+        return result if isinstance(result, dict) else {}
     except Exception:
         return {}
 
