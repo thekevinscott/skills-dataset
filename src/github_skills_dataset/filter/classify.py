@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from .config import CONTENT_MAX_BYTES
 from .embed import content_hash, blob_to_vector, DEFAULT_EMBEDDING_MODEL
-from .filter import init_output_db, resolve_content_path
+from .filter import init_output_db, open_db, resolve_content_path
 from .parse_github_url import parse_github_url
 
 
@@ -33,7 +33,7 @@ def load_labeled_csv(csv_path: Path) -> list[dict]:
 
 def get_embedding_vectors(db_path: Path, content_hashes: list[str], model: str) -> dict[str, np.ndarray]:
     """Look up embedding vectors from DB. Returns {content_hash: vector}."""
-    conn = sqlite3.connect(db_path)
+    conn = open_db(db_path)
     vectors = {}
     for ch in content_hashes:
         row = conn.execute(
@@ -131,7 +131,7 @@ async def classify_pass(args):
             print(f"  Could not find 95% threshold, using default: {threshold}")
 
     # Predict on all URLs with frontmatter and no heuristic reject
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
     urls_to_classify = [
         row[0] for row in conn.execute(
             "SELECT url FROM validation_results WHERE has_frontmatter = 1 AND (heuristic_reject IS NULL OR heuristic_reject != 1)"
@@ -158,7 +158,7 @@ async def classify_pass(args):
     all_vectors = get_embedding_vectors(args.output_db, all_hashes, model)
 
     # Predict
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
     classified = 0
     no_embedding = 0
 
@@ -188,7 +188,7 @@ async def classify_pass(args):
     print(f"  Confidence threshold for LLM fallback: {threshold}")
 
     # Report confidence distribution
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
     above = conn.execute(
         "SELECT COUNT(*) FROM validation_results WHERE embedding_confidence >= ?",
         (threshold,)

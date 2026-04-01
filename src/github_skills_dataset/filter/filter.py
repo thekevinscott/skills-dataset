@@ -46,10 +46,17 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
     return content_dir / owner / repo / "blob" / ref / path
 
 
-def init_output_db(output_db: Path):
-    """Create/migrate the output database."""
+def open_db(output_db: Path) -> sqlite3.Connection:
+    """Open DB with WAL mode and busy timeout."""
     conn = sqlite3.connect(output_db)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def init_output_db(output_db: Path):
+    """Create/migrate the output database."""
+    conn = open_db(output_db)
 
     # --- validation_results: pass 1 (frontmatter check) ---
     existing = conn.execute(
@@ -171,7 +178,7 @@ async def filter_pass1(args, to_validate=None):
     if to_validate is None:
         _, to_validate, _ = scan_content(args)
 
-    out_conn = sqlite3.connect(args.output_db)
+    out_conn = open_db(args.output_db)
     already_checked = set(
         row[0] for row in out_conn.execute("SELECT url FROM validation_results").fetchall()
     )
@@ -198,7 +205,7 @@ async def filter_pass1(args, to_validate=None):
     print(f"  No valid frontmatter: {no_frontmatter:,}")
     print(f"  Has frontmatter: {yes_frontmatter:,}")
 
-    out_conn = sqlite3.connect(args.output_db)
+    out_conn = open_db(args.output_db)
     for i, (url, has_fm) in enumerate(frontmatter_results):
         out_conn.execute(
             "INSERT OR IGNORE INTO validation_results (url, has_frontmatter) VALUES (?, ?)",
@@ -224,7 +231,7 @@ async def filter_pass2(args, to_validate=None):
         _, to_validate, _ = scan_content(args)
 
     # Skip: frontmatter failures, heuristic rejects, confident embeddings
-    out_conn = sqlite3.connect(args.output_db)
+    out_conn = open_db(args.output_db)
     skip_urls = set()
 
     # Frontmatter failures
@@ -285,7 +292,7 @@ async def filter_pass2(args, to_validate=None):
     print(f"  Cached (no API call): {len(local_results):,}")
     print(f"  Need LLM call: {total_uncached:,}")
 
-    out_conn = sqlite3.connect(args.output_db)
+    out_conn = open_db(args.output_db)
     for url, is_skill, reason in local_results:
         out_conn.execute(
             "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, base_url, is_skill, reason) VALUES (?, ?, ?, ?, ?, ?)",
@@ -295,7 +302,7 @@ async def filter_pass2(args, to_validate=None):
     out_conn.close()
 
     if not uncached:
-        conn = sqlite3.connect(args.output_db)
+        conn = open_db(args.output_db)
         final_valid = conn.execute(
             "SELECT COUNT(*) FROM llm_skill_evaluation WHERE is_skill = 1 AND backend = ? AND model = ?",
             (backend, model)
@@ -368,7 +375,7 @@ async def filter_pass2(args, to_validate=None):
                 return parse_response(text)
 
     unique_items = list(uncached.items())
-    out_conn = sqlite3.connect(args.output_db)
+    out_conn = open_db(args.output_db)
     valid_count = 0
     invalid_count = 0
     error_count = 0
@@ -432,7 +439,7 @@ async def filter_pass2(args, to_validate=None):
     t_pass2 = time.monotonic() - t_start
     print(f"Done in {t_pass2:.1f}s: valid={valid_count:,}, rejected={invalid_count:,}, errors={error_count:,}")
 
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
     final_valid = conn.execute(
         "SELECT COUNT(*) FROM llm_skill_evaluation WHERE is_skill = 1 AND backend = ? AND model = ?",
         (backend, model)

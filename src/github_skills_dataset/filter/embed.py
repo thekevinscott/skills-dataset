@@ -10,7 +10,7 @@ import httpx
 from tqdm import tqdm
 
 from .config import CONTENT_MAX_BYTES
-from .filter import init_output_db, scan_content, resolve_content_path
+from .filter import init_output_db, open_db, scan_content, resolve_content_path
 from .parse_github_url import parse_github_url
 
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
@@ -42,7 +42,7 @@ async def embed_pass(args):
     _, to_validate, _ = scan_content(args)
 
     # Get URLs with frontmatter
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
     has_fm = set(
         row[0] for row in conn.execute(
             "SELECT url FROM validation_results WHERE has_frontmatter = 1"
@@ -69,7 +69,7 @@ async def embed_pass(args):
 
     all_hashes = set(ch for ch, _ in url_hashes.values())
 
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
     existing = set(
         row[0] for row in conn.execute(
             "SELECT content_hash FROM embeddings WHERE model = ?", (model,)
@@ -95,7 +95,7 @@ async def embed_pass(args):
     # Embed in batches via Ollama
     batch_size = 32
     items = list(hash_to_content.items())
-    conn = sqlite3.connect(args.output_db)
+    conn = open_db(args.output_db)
 
     t_start = time.monotonic()
     async with httpx.AsyncClient(timeout=120.0) as client:

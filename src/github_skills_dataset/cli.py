@@ -80,9 +80,8 @@ def filter_pass1_cmd(main_db, output_db, content_dir):
 def filter_pass2_cmd(main_db, output_db, content_dir):
     """Pass 2: reject files matching heuristic rules (instant, no LLM)."""
     from .filter.heuristics import heuristic_reject
-    from .filter.filter import init_output_db, scan_content, resolve_content_path
+    from .filter.filter import init_output_db, open_db, scan_content, resolve_content_path
     from .filter.parse_github_url import parse_github_url
-    import sqlite3
     from tqdm import tqdm
 
     init_output_db(output_db)
@@ -90,7 +89,7 @@ def filter_pass2_cmd(main_db, output_db, content_dir):
         main_db=main_db, output_db=output_db, content_dir=content_dir,
     ))
 
-    conn = sqlite3.connect(output_db)
+    conn = open_db(output_db)
     has_fm = set(
         row[0] for row in conn.execute(
             "SELECT url FROM validation_results WHERE has_frontmatter = 1"
@@ -101,7 +100,7 @@ def filter_pass2_cmd(main_db, output_db, content_dir):
     urls = [url for url in to_validate if url in has_fm]
     print(f"  Running heuristics on {len(urls):,} URLs...")
 
-    conn = sqlite3.connect(output_db)
+    conn = open_db(output_db)
     rejected = 0
     checked = 0
     for url in tqdm(urls, desc="Pass 2: heuristics", unit="url"):
@@ -202,20 +201,19 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concur
 
     print("\n=== Pass 2: Heuristics ===")
     # Invoke pass 2 inline (same logic as CLI command)
-    import sqlite3
     from .filter.heuristics import heuristic_reject
-    from .filter.filter import init_output_db, scan_content, resolve_content_path
+    from .filter.filter import init_output_db, open_db, scan_content, resolve_content_path
     from .filter.parse_github_url import parse_github_url
     from tqdm import tqdm
 
     _, to_validate, _ = scan_content(args_common)
-    conn = sqlite3.connect(output_db)
+    conn = open_db(output_db)
     has_fm = set(row[0] for row in conn.execute(
         "SELECT url FROM validation_results WHERE has_frontmatter = 1"
     ).fetchall())
     conn.close()
     urls = [url for url in to_validate if url in has_fm]
-    conn = sqlite3.connect(output_db)
+    conn = open_db(output_db)
     for url in tqdm(urls, desc="Pass 2: heuristics", unit="url"):
         parsed = parse_github_url(url)
         if not parsed:
