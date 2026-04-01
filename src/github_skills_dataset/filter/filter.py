@@ -49,6 +49,7 @@ def resolve_content_path(content_dir: Path, owner: str, repo: str, ref: str, pat
 def init_output_db(output_db: Path):
     """Create/migrate the output database."""
     conn = sqlite3.connect(output_db)
+    conn.execute("PRAGMA journal_mode=WAL")
 
     # --- validation_results: pass 1 (frontmatter check) ---
     existing = conn.execute(
