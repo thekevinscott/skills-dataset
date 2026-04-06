@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
+from xgboost import XGBClassifier
 from tqdm import tqdm
 
 from .config import CONTENT_MAX_BYTES
@@ -83,28 +83,36 @@ async def classify_pass(args):
         print("  Not enough labeled examples with embeddings. Run pass 3 first.")
         return
 
-    # Stratified train/val split
+    # Stratified split: balanced val set, downsampled train
     random.seed(42)
     positives = [ex for ex in labeled_with_vec if ex["is_skill"]]
     negatives = [ex for ex in labeled_with_vec if not ex["is_skill"]]
     random.shuffle(positives)
     random.shuffle(negatives)
 
-    split_pos = int(len(positives) * 0.8)
-    split_neg = int(len(negatives) * 0.8)
-    train = positives[:split_pos] + negatives[:split_neg]
-    val = positives[split_pos:] + negatives[split_neg:]
+    # Hold out 1/3 of negatives for val, match with equal positives
+    val_neg_count = max(len(negatives) // 3, 5)
+    val = positives[:val_neg_count] + negatives[:val_neg_count]
+    train_pos = positives[val_neg_count:]
+    train_neg = negatives[val_neg_count:]
 
-    print(f"  Train: {len(train)} ({sum(1 for e in train if e['is_skill'])} pos, {sum(1 for e in train if not e['is_skill'])} neg)")
-    print(f"  Val: {len(val)} ({sum(1 for e in val if e['is_skill'])} pos, {sum(1 for e in val if not e['is_skill'])} neg)")
+    # Downsample majority class to match minority for training
+    train_down_pos = random.sample(train_pos, min(len(train_pos), len(train_neg)))
+    train = train_down_pos + train_neg
 
-    # Train
+    print(f"  Val (balanced): {len(val)} ({val_neg_count} pos, {val_neg_count} neg)")
+    print(f"  Train (downsampled): {len(train)} ({len(train_down_pos)} pos, {len(train_neg)} neg)")
+
+    # Train XGBoost
     X_train = np.array([vectors[ex["content_hash"]] for ex in train])
     y_train = np.array([1 if ex["is_skill"] else 0 for ex in train])
     X_val = np.array([vectors[ex["content_hash"]] for ex in val])
     y_val = np.array([1 if ex["is_skill"] else 0 for ex in val])
 
-    clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+    clf = XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.1,
+        eval_metric='logloss', verbosity=0,
+    )
     clf.fit(X_train, y_train)
 
     # Evaluate on val
