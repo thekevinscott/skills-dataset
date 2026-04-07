@@ -128,49 +128,33 @@ def filter_pass2_cmd(main_db, output_db, content_dir):
     print(f"  Checked: {checked:,}, Rejected: {rejected:,}")
 
 
-# --- Pass 3: Embed ---
+# --- Pass 3: Classify (SVM + TF-IDF + heuristics) ---
 
 @cli.command("filter-pass-3")
-@_apply_options(_filter_common_options)
-@click.option("--embedding-model", default="nomic-embed-text", help="Ollama embedding model")
-@click.option("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
-def filter_pass3_cmd(main_db, output_db, content_dir, embedding_model, ollama_url):
-    """Pass 3: generate embeddings for all files via Ollama."""
-    from .filter.embed import embed_pass
-    asyncio.run(embed_pass(_make_args(
-        main_db=main_db, output_db=output_db, content_dir=content_dir,
-        embedding_model=embedding_model, ollama_url=ollama_url,
-    )))
-
-
-# --- Pass 4: Classify with embeddings ---
-
-@cli.command("filter-pass-4")
 @_apply_options(_output_db_option)
 @click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("data/labeled.csv"),
               help="Labeled data CSV (default: data/labeled.csv)")
-@click.option("--embedding-model", default="nomic-embed-text", help="Ollama embedding model")
 @click.option("--confidence-threshold", default=None, type=float,
               help="Confidence threshold (auto-detected if not set)")
-def filter_pass4_cmd(output_db, content_dir, labeled_csv, embedding_model, confidence_threshold):
-    """Pass 4: train embedding classifier and predict on all files."""
+def filter_pass3_cmd(output_db, content_dir, labeled_csv, confidence_threshold):
+    """Pass 3: train SVM classifier and predict on all files."""
     from .filter.classify import classify_pass
     asyncio.run(classify_pass(_make_args(
         output_db=output_db, content_dir=content_dir,
-        labeled_csv=labeled_csv, embedding_model=embedding_model,
+        labeled_csv=labeled_csv,
         confidence_threshold=confidence_threshold,
     )))
 
 
-# --- Pass 5: LLM fallback ---
+# --- Pass 4: LLM fallback ---
 
-@cli.command("filter-pass-5")
+@cli.command("filter-pass-4")
 @_apply_options(_filter_common_options + _filter_llm_options)
 @click.option("--limit", default=None, type=int, help="Process at most N URLs (for testing)")
-@click.option("--confidence-threshold", default=0.8, type=float,
-              help="Only classify URLs with embedding confidence below this (default: 0.8)")
-def filter_pass5_cmd(main_db, output_db, content_dir, model, base_url, concurrency, backend, limit, confidence_threshold):
-    """Pass 5: LLM classification for low-confidence embeddings."""
+@click.option("--confidence-threshold", default=0.5, type=float,
+              help="Only classify URLs with classifier confidence below this (default: 0.5)")
+def filter_pass4_cmd(main_db, output_db, content_dir, model, base_url, concurrency, backend, limit, confidence_threshold):
+    """Pass 4: LLM classification for low-confidence predictions."""
     from .filter import filter_pass2
     asyncio.run(filter_pass2(_make_args(
         main_db=main_db, output_db=output_db, content_dir=content_dir,
@@ -183,15 +167,12 @@ def filter_pass5_cmd(main_db, output_db, content_dir, model, base_url, concurren
 
 @cli.command("filter-valid-skills")
 @_apply_options(_filter_common_options + _filter_llm_options)
-@click.option("--embedding-model", default="nomic-embed-text", help="Ollama embedding model")
-@click.option("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
 @click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("data/labeled.csv"))
 @click.option("--confidence-threshold", default=None, type=float)
 def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concurrency, backend,
-                        embedding_model, ollama_url, labeled_csv, confidence_threshold):
-    """Run all 5 filter passes in sequence."""
+                        labeled_csv, confidence_threshold):
+    """Run all 4 filter passes in sequence."""
     from .filter import filter_pass1, filter_pass2
-    from .filter.embed import embed_pass
     from .filter.classify import classify_pass
 
     args_common = _make_args(main_db=main_db, output_db=output_db, content_dir=content_dir)
@@ -231,24 +212,18 @@ def filter_valid_skills(main_db, output_db, content_dir, model, base_url, concur
     conn.commit()
     conn.close()
 
-    print("\n=== Pass 3: Embed ===")
-    asyncio.run(embed_pass(_make_args(
-        main_db=main_db, output_db=output_db, content_dir=content_dir,
-        embedding_model=embedding_model, ollama_url=ollama_url,
-    )))
-
-    print("\n=== Pass 4: Classify ===")
+    print("\n=== Pass 3: Classify ===")
     asyncio.run(classify_pass(_make_args(
         output_db=output_db, content_dir=content_dir,
-        labeled_csv=labeled_csv, embedding_model=embedding_model,
+        labeled_csv=labeled_csv,
         confidence_threshold=confidence_threshold,
     )))
 
-    print("\n=== Pass 5: LLM fallback ===")
+    print("\n=== Pass 4: LLM fallback ===")
     asyncio.run(filter_pass2(_make_args(
         main_db=main_db, output_db=output_db, content_dir=content_dir,
         model=model, base_url=base_url, concurrency=concurrency, backend=backend,
-        limit=None, confidence_threshold=confidence_threshold or 0.8,
+        limit=None, confidence_threshold=confidence_threshold or 0.5,
     )))
 
 
