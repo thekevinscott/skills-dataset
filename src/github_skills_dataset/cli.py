@@ -296,8 +296,11 @@ def regenerate_labels(output_db, output_csv):
     """Regenerate labeled.csv from LLM evaluation results.
 
     Reads all successful LLM classifications from llm_skill_evaluation
-    and writes a CSV with url,is_skill columns. Run this after
-    generate-training-data to update the classifier's training set.
+    and writes a CSV with url,content_hash,is_skill columns. Model info
+    is written as a header comment to avoid per-row repetition.
+
+    Run this after generate-training-data to update the classifier's
+    training set.
 
     Workflow:
       1. skills-dataset generate-training-data ...
@@ -308,21 +311,30 @@ def regenerate_labels(output_db, output_csv):
     from .filter.filter import open_db
 
     conn = open_db(output_db)
+
+    # Get model info for header
+    models = conn.execute("""
+        SELECT DISTINCT backend, model FROM llm_skill_evaluation
+    """).fetchall()
+
     rows = conn.execute("""
-        SELECT url, is_skill FROM llm_skill_evaluation
-        WHERE reason NOT LIKE 'Error:%'
+        SELECT url, content_hash, is_skill FROM llm_skill_evaluation
+        WHERE reason IS NULL OR reason NOT LIKE 'Error:%'
     """).fetchall()
     conn.close()
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(output_csv, "w", newline="") as f:
+        # Write model info as comments
+        for backend, model in models:
+            f.write(f"# backend={backend}, model={model}\n")
         writer = csv.writer(f)
-        writer.writerow(["url", "is_skill"])
-        for url, is_skill in rows:
-            writer.writerow([url, "true" if is_skill else "false"])
+        writer.writerow(["url", "content_hash", "is_skill"])
+        for url, content_hash, is_skill in rows:
+            writer.writerow([url, content_hash or "", "true" if is_skill else "false"])
 
-    n_true = sum(1 for _, s in rows if s)
-    n_false = sum(1 for _, s in rows if not s)
+    n_true = sum(1 for _, _, s in rows if s)
+    n_false = sum(1 for _, _, s in rows if not s)
     print(f"Wrote {output_csv}: {len(rows):,} rows ({n_true:,} true, {n_false:,} false)")
 
 

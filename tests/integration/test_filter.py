@@ -83,24 +83,24 @@ def _frontmatter_state(output_db):
 
 
 def _eval_state(output_db):
-    """Return {url: (is_skill, reason)} from llm_skill_evaluation."""
+    """Return {url: is_skill} from llm_skill_evaluation."""
     conn = sqlite3.connect(output_db)
-    rows = conn.execute("SELECT url, is_skill, reason FROM llm_skill_evaluation").fetchall()
+    rows = conn.execute("SELECT url, is_skill FROM llm_skill_evaluation").fetchall()
     conn.close()
-    return {r[0]: (r[1], r[2]) for r in rows}
+    return {r[0]: r[1] for r in rows}
 
 
 def _mock_anthropic_client(responses):
     """Create a mock Anthropic client that returns canned responses.
 
-    responses: dict mapping content substring to (is_skill, reason).
+    responses: dict mapping content substring to is_skill boolean.
     """
     async def fake_create(**kwargs):
         content = kwargs["messages"][0]["content"]
-        for key, (is_skill, reason) in responses.items():
+        for key, is_skill in responses.items():
             if key in content:
                 result = mock.MagicMock()
-                result.content = [mock.MagicMock(text=f'{{"is_skill": {str(is_skill).lower()}, "reason": "{reason}"}}')]
+                result.content = [mock.MagicMock(text=f'{{"is_skill": {str(is_skill).lower()}}}')]
                 return result
         raise ValueError(f"No mock response for content: {content[:100]}")
 
@@ -147,22 +147,22 @@ class TestPass2Integration:
         """Pass 2 calls LLM for files with frontmatter and stores results."""
         asyncio.run(filter_pass1(_args(env)))
 
-        responses = {"Test Skill": (True, "Valid skill file")}
+        responses = {"Test Skill": True}
         client = _mock_anthropic_client(responses)
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
             asyncio.run(filter_pass2(_args(env)))
 
         evals = _eval_state(env.output_db)
-        assert evals[env.urls["valid1"]][0] == 1  # is_skill=1
-        assert evals[env.urls["valid2"]][0] == 1
+        assert evals[env.urls["valid1"]] == 1  # is_skill=1
+        assert evals[env.urls["valid2"]] == 1
         assert env.urls["no_fm"] not in evals  # no frontmatter, no eval
 
     def test_skips_completed_on_rerun(self, env):
         """Re-running pass 2 should not re-call LLM for completed URLs."""
         asyncio.run(filter_pass1(_args(env)))
 
-        responses = {"Test Skill": (True, "Valid skill file")}
+        responses = {"Test Skill": True}
         client = _mock_anthropic_client(responses)
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
@@ -178,7 +178,7 @@ class TestPass2Integration:
 class TestFullPipelineIntegration:
     def test_filter_runs_both_passes(self, env):
         """The combined filter command runs pass 1 then pass 2."""
-        responses = {"Test Skill": (True, "Valid skill file")}
+        responses = {"Test Skill": True}
         client = _mock_anthropic_client(responses)
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
@@ -189,12 +189,12 @@ class TestFullPipelineIntegration:
         assert fm[env.urls["no_fm"]] == 0
 
         evals = _eval_state(env.output_db)
-        assert evals[env.urls["valid1"]][0] == 1
-        assert evals[env.urls["valid2"]][0] == 1
+        assert evals[env.urls["valid1"]] == 1
+        assert evals[env.urls["valid2"]] == 1
 
     def test_rerun_after_full_pipeline(self, env):
         """Full re-run should skip everything."""
-        responses = {"Test Skill": (True, "Valid skill file")}
+        responses = {"Test Skill": True}
         client = _mock_anthropic_client(responses)
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client):
@@ -208,7 +208,7 @@ class TestFullPipelineIntegration:
 
     def test_scan_runs_once_in_combined(self, env):
         """filter() should only scan content once, not twice."""
-        responses = {"Test Skill": (True, "Valid skill file")}
+        responses = {"Test Skill": True}
         client = _mock_anthropic_client(responses)
 
         with mock.patch("anthropic.AsyncAnthropic", return_value=client), \

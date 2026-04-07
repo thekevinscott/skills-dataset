@@ -21,14 +21,17 @@ from .parse_github_url import parse_github_url
 
 
 def load_labeled_csv(csv_path: Path) -> list[dict]:
-    """Load labeled examples from CSV."""
+    """Load labeled examples from CSV. Skips comment lines (# ...)."""
     examples = []
     with open(csv_path) as f:
-        for row in csv.DictReader(f):
-            examples.append({
-                "url": row["url"],
-                "is_skill": row["is_skill"].lower() == "true",
-            })
+        # Skip comment lines
+        lines = [line for line in f if not line.startswith('#')]
+    reader = csv.DictReader(lines)
+    for row in reader:
+        examples.append({
+            "url": row["url"],
+            "is_skill": row["is_skill"].lower() == "true",
+        })
     return examples
 
 

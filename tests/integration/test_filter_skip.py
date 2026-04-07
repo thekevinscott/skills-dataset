@@ -165,7 +165,7 @@ class TestPass2Unit:
         with mock.patch.object(Path, "read_text", mock_read), \
              mock.patch("github_skills_dataset.filter.filter.async_read_cache") as mock_cache:
             # Simulate cache hit
-            mock_cache.return_value.__aenter__ = mock.AsyncMock(return_value={"is_skill": True, "reason": "Valid skill"})
+            mock_cache.return_value.__aenter__ = mock.AsyncMock(return_value={"is_skill": True})
             mock_cache.return_value.__aexit__ = mock.AsyncMock(return_value=False)
             args = _args(main_db, output_db)
             asyncio.run(filter_pass2(args, to_validate=[URL_FM_YES]))

@@ -12,7 +12,7 @@ from pathlib import Path
 from cachetta import async_read_cache, async_write_cache
 from tqdm import tqdm
 
-from .config import DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
+from .config import CONTENT_MAX_BYTES, DEFAULT_MODEL, VALIDATION_PROMPT, llm_cache
 from .parse_github_url import parse_github_url
 from .has_valid_frontmatter import has_valid_frontmatter
 
@@ -125,11 +125,14 @@ def init_output_db(output_db: Path):
         eval_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_skill_evaluation)")}
         if "base_url" not in eval_cols:
             conn.execute("ALTER TABLE llm_skill_evaluation ADD COLUMN base_url TEXT")
+        if "content_hash" not in eval_cols:
+            conn.execute("ALTER TABLE llm_skill_evaluation ADD COLUMN content_hash TEXT")
     else:
         conn.execute("""
             CREATE TABLE llm_skill_evaluation (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT,
+                content_hash TEXT,
                 backend TEXT NOT NULL,
                 model TEXT NOT NULL,
                 base_url TEXT,
@@ -268,8 +271,9 @@ async def filter_pass2(args, to_validate=None):
 
     print(f"  Already done: {skipped:,}, to classify: {len(to_classify):,}")
 
-    local_results = []
-    uncached = {}
+    local_results = []  # (url, is_skill, content_hash)
+    uncached = {}  # cache_key -> (content, [(url, content_hash)])
+    url_content_hashes = {}  # url -> content_hash
     t_start = time.monotonic()
     for url in tqdm(to_classify, desc="Pass 2: prep", unit="file"):
         parsed = parse_github_url(url)
@@ -278,21 +282,23 @@ async def filter_pass2(args, to_validate=None):
         content = local_path.read_text(errors='replace')
         if not has_valid_frontmatter(content):
             continue
+        c_hash = hashlib.sha256(content[:CONTENT_MAX_BYTES].encode()).hexdigest()
+        url_content_hashes[url] = c_hash
         prompt = VALIDATION_PROMPT.format(content=content)
         cache_key = make_cache_key(prompt, model, base_url)
         entry_cache = llm_cache / f"{cache_key}.json"
 
         async with async_read_cache(entry_cache) as cached:
             if cached is not None:
-                local_results.append((url, cached["is_skill"], cached.get("reason", "")))
+                local_results.append((url, cached["is_skill"], c_hash))
                 continue
 
         if cache_key in uncached:
-            uncached[cache_key][1].append(url)
+            uncached[cache_key][1].append((url, c_hash))
         else:
-            uncached[cache_key] = (content, [url])
+            uncached[cache_key] = (content, [(url, c_hash)])
 
-    total_uncached = sum(len(urls) for _, urls in uncached.values())
+    total_uncached = sum(len(url_hashes) for _, url_hashes in uncached.values())
 
     t_prep = time.monotonic() - t_start
     print(f"\nPass 2 - LLM classification ({t_prep:.1f}s prep):")
@@ -300,10 +306,10 @@ async def filter_pass2(args, to_validate=None):
     print(f"  Need LLM call: {total_uncached:,}")
 
     out_conn = open_db(args.output_db)
-    for url, is_skill, reason in local_results:
+    for url, is_skill, c_hash in local_results:
         out_conn.execute(
-            "INSERT OR IGNORE INTO llm_skill_evaluation (url, backend, model, base_url, is_skill, reason) VALUES (?, ?, ?, ?, ?, ?)",
-            (url, backend, model, base_url, is_skill, reason)
+            "INSERT OR IGNORE INTO llm_skill_evaluation (url, content_hash, backend, model, base_url, is_skill) VALUES (?, ?, ?, ?, ?, ?)",
+            (url, c_hash, backend, model, base_url, is_skill)
         )
     out_conn.commit()
     out_conn.close()
@@ -390,30 +396,29 @@ async def filter_pass2(args, to_validate=None):
     completed = 0
     total = len(unique_items)
 
-    async def process_one(cache_key, content, urls):
+    async def process_one(cache_key, content, url_hashes):
         """Validate and return result with metadata, retrying up to 3 times."""
         last_error = None
         for attempt in range(3):
             try:
                 result = await validate_one(cache_key, content)
                 is_skill = result.get("is_skill", False)
-                reason = result.get("reason", "")
-                return cache_key, urls, is_skill, reason, None
+                return cache_key, url_hashes, is_skill, None
             except Exception as e:
                 last_error = e
                 if attempt < 2:
                     await asyncio.sleep(2 * (attempt + 1))
-        return cache_key, urls, False, f"Error: {str(last_error)[:80]}", last_error
+        return cache_key, url_hashes, False, last_error
 
     tasks = [
-        asyncio.create_task(process_one(cache_key, content, urls))
-        for cache_key, (content, urls) in unique_items
+        asyncio.create_task(process_one(cache_key, content, url_hashes))
+        for cache_key, (content, url_hashes) in unique_items
     ]
 
     t_start = time.monotonic()
     bar = tqdm(asyncio.as_completed(tasks), total=total, desc="Pass 2: LLM", unit="file")
     for coro in bar:
-        cache_key, urls, is_skill, reason, error = await coro
+        cache_key, url_hashes, is_skill, error = await coro
         completed += 1
 
         if error and first_error is None:
@@ -424,12 +429,12 @@ async def filter_pass2(args, to_validate=None):
             error_count += 1
         else:
             entry_cache = llm_cache / f"{cache_key}.json"
-            await async_write_cache(entry_cache, {"is_skill": is_skill, "reason": reason})
+            await async_write_cache(entry_cache, {"is_skill": is_skill})
 
-        for url in urls:
+        for url, c_hash in url_hashes:
             out_conn.execute(
-                "INSERT OR REPLACE INTO llm_skill_evaluation (url, backend, model, base_url, is_skill, reason) VALUES (?, ?, ?, ?, ?, ?)",
-                (url, backend, model, base_url, is_skill, reason)
+                "INSERT OR REPLACE INTO llm_skill_evaluation (url, content_hash, backend, model, base_url, is_skill) VALUES (?, ?, ?, ?, ?, ?)",
+                (url, c_hash, backend, model, base_url, is_skill)
             )
             if is_skill:
                 valid_count += 1
