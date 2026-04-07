@@ -110,36 +110,7 @@ skills-dataset filter-valid-skills \
   --content-dir data/content
 ```
 
-## 4. Generate training data (optional, requires LLM)
-
-The classifier improves over time by labeling new files with an LLM. This is **not** part of the main pipeline -- run it when you have LLM budget.
-
-Reads `training/labeled.csv` to skip already-labeled content hashes, sends unlabeled files to the LLM, appends results to the CSV.
-
-```bash
-skills-dataset generate-training-data \
-  --main-db data/skills.db \
-  --output-db data/validated.db \
-  --content-dir data/content \
-  --backend claude-agent-sdk \
-  --concurrency 8 \
-  --limit 5000
-```
-
-After labeling, retrain the classifier:
-
-```bash
-skills-dataset filter-pass-3 \
-  --output-db data/validated.db \
-  --content-dir data/content
-```
-
-LLM backends:
-- `--backend anthropic`: Anthropic API (per-token billing)
-- `--backend openai --base-url http://host:11434/v1 --model gemma2:27b`: Ollama/local
-- `--backend claude-agent-sdk`: Claude Code subscription (no API key needed)
-
-## 5. Fetch metadata and history
+## 4. Fetch metadata and history
 
 Prepare a `files` table in validated.db for the fetcher, then run:
 
@@ -153,7 +124,7 @@ uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
   github-fetch fetch-file-history --db data/validated.db
 ```
 
-## 6. Export to Parquet
+## 5. Export to Parquet
 
 ```bash
 skills-dataset export \
@@ -163,7 +134,7 @@ skills-dataset export \
   --kaggle-username yourname
 ```
 
-## 7. Upload to Kaggle
+## 6. Upload to Kaggle
 
 ```bash
 cd build && kaggle datasets create -p . --dir-mode tar
@@ -215,6 +186,33 @@ With ~33K unique labeled content hashes (~684 rejects):
 - **Holdout accuracy: ~90%** (balanced val set)
 
 Performance improves with more labeled rejects. Run `generate-training-data` to produce these.
+
+## Training
+
+The classifier improves over time by labeling new files with an LLM. This is separate from the main pipeline -- run it when you have LLM budget.
+
+```bash
+skills-dataset generate-training-data \
+  --main-db data/skills.db \
+  --output-db data/validated.db \
+  --content-dir data/content \
+  --backend claude-agent-sdk \
+  --concurrency 8 \
+  --limit 5000
+```
+
+This reads `training/labeled.csv` to skip already-labeled content, sends unlabeled files to the LLM, and appends results to the CSV. After labeling, retrain the classifier:
+
+```bash
+skills-dataset filter-pass-3 \
+  --output-db data/validated.db \
+  --content-dir data/content
+```
+
+LLM backends:
+- `--backend anthropic`: Anthropic API (per-token billing)
+- `--backend openai --base-url http://host:11434/v1 --model gemma2:27b`: Ollama/local
+- `--backend claude-agent-sdk`: Claude Code subscription (no API key needed)
 
 ## Development
 
