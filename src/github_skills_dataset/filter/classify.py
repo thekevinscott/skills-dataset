@@ -162,7 +162,7 @@ def _fm_bow_vector(content: str, vocab: list[str]) -> np.ndarray:
 async def classify_pass(args):
     """Train SVM classifier on labeled data, predict on all files."""
     init_output_db(args.output_db)
-    csv_path = Path(getattr(args, 'labeled_csv', 'data/labeled.csv'))
+    csv_path = Path(getattr(args, 'labeled_csv', 'training/labeled.csv'))
 
     # Load labeled data with content
     labeled = load_labeled_csv(csv_path)

@@ -167,7 +167,7 @@ def filter_pass2_cmd(main_db, output_db, content_dir):
 
 @cli.command("filter-pass-3")
 @_apply_options(_output_db_option)
-@click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("data/labeled.csv"),
+@click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("training/labeled.csv"),
               help="Labeled training data CSV with 'url' and 'is_skill' columns")
 def filter_pass3_cmd(output_db, content_dir, labeled_csv):
     """Pass 3: Train SVM classifier and predict on all files.
@@ -194,7 +194,7 @@ def filter_pass3_cmd(output_db, content_dir, labeled_csv):
 
 @cli.command("filter-valid-skills")
 @_apply_options(_filter_common_options)
-@click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("data/labeled.csv"),
+@click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("training/labeled.csv"),
               help="Labeled training data CSV")
 def filter_valid_skills(main_db, output_db, content_dir, labeled_csv):
     """Run the full classification pipeline (passes 1-3).
@@ -290,8 +290,8 @@ def generate_training_data(main_db, output_db, content_dir, model, base_url, con
 @cli.command("regenerate-labels")
 @click.option("--output-db", type=click.Path(path_type=Path), default=Path("validated.db"),
               help="Database with LLM evaluations (default: validated.db)")
-@click.option("--output-csv", type=click.Path(path_type=Path), default=Path("data/labeled.csv"),
-              help="Output CSV path (default: data/labeled.csv)")
+@click.option("--output-csv", type=click.Path(path_type=Path), default=Path("training/labeled.csv"),
+              help="Output CSV path (default: training/labeled.csv)")
 def regenerate_labels(output_db, output_csv):
     """Regenerate labeled.csv from LLM evaluation results.
 

@@ -98,7 +98,7 @@ Features: TF-IDF bigrams (1000) + heuristic features (51) + URL features (8) + f
 skills-dataset filter-pass-3 \
   --output-db data/validated.db \
   --content-dir data/content \
-  --labeled-csv data/labeled.csv
+  --labeled-csv training/labeled.csv
 ```
 
 ### Combined (all 3 passes)
