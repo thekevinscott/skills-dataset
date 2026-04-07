@@ -179,7 +179,7 @@ def filter_pass3_cmd(output_db, content_dir, labeled_csv):
     Features: TF-IDF (1000 bigrams) + heuristic features (51) + URL
     features (8) + frontmatter key bag-of-words.
 
-    Writes embedding_is_skill (0/1) and embedding_confidence (0.0-1.0)
+    Writes classifier_is_skill (0/1) and classifier_confidence (0.0-1.0)
     to validation_results. Confidence = distance from decision boundary.
 
     The classifier retrains from scratch every run (training is instant,
@@ -287,6 +287,45 @@ def generate_training_data(main_db, output_db, content_dir, model, base_url, con
     )))
 
 
+@cli.command("regenerate-labels")
+@click.option("--output-db", type=click.Path(path_type=Path), default=Path("validated.db"),
+              help="Database with LLM evaluations (default: validated.db)")
+@click.option("--output-csv", type=click.Path(path_type=Path), default=Path("data/labeled.csv"),
+              help="Output CSV path (default: data/labeled.csv)")
+def regenerate_labels(output_db, output_csv):
+    """Regenerate labeled.csv from LLM evaluation results.
+
+    Reads all successful LLM classifications from llm_skill_evaluation
+    and writes a CSV with url,is_skill columns. Run this after
+    generate-training-data to update the classifier's training set.
+
+    Workflow:
+      1. skills-dataset generate-training-data ...
+      2. skills-dataset regenerate-labels
+      3. skills-dataset filter-pass-3 ...
+    """
+    import csv
+    from .filter.filter import open_db
+
+    conn = open_db(output_db)
+    rows = conn.execute("""
+        SELECT url, is_skill FROM llm_skill_evaluation
+        WHERE reason NOT LIKE 'Error:%'
+    """).fetchall()
+    conn.close()
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["url", "is_skill"])
+        for url, is_skill in rows:
+            writer.writerow([url, "true" if is_skill else "false"])
+
+    n_true = sum(1 for _, s in rows if s)
+    n_false = sum(1 for _, s in rows if not s)
+    print(f"Wrote {output_csv}: {len(rows):,} rows ({n_true:,} true, {n_false:,} false)")
+
+
 # ============================================================
 # Export
 # ============================================================
@@ -303,22 +342,73 @@ def generate_training_data(main_db, output_db, content_dir, model, base_url, con
               help="Allow export even if some valid files have no repo metadata")
 @click.option("--allow-no-history", is_flag=True, default=False,
               help="Allow export even if some valid files have no commit history")
-@click.option("--model", default=None,
-              help="Use only this LLM model's evaluations (default: any)")
-def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history, model):
+@click.option("--min-confidence", default=None, type=float,
+              help="Only export URLs with classifier confidence >= this (default: all)")
+def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history, min_confidence):
     """Export validated skills to Parquet for Kaggle.
 
     Reads classification results from --validation-db and exports files,
     repos, and history to Parquet format. Uses the SVM classifier results
-    (embedding_is_skill) from validation_results, excluding heuristic
-    rejects. Confidence scores included in output.
+    (classifier_is_skill) from validation_results, excluding heuristic
+    rejects.
+
+    Use --min-confidence to filter by classifier confidence score:
+      0.0  = all predictions (~90% accuracy, ~1.4% noise)
+      0.3  = balanced (~92% accuracy)
+      0.5  = high quality (~94% accuracy)
+      0.65 = very high quality (~95% accuracy)
     """
     from .export import main as export_main
     export_main(_make_args(
         main_db=main_db, validation_db=validation_db, output_dir=output_dir,
         kaggle_username=kaggle_username, allow_no_repo=allow_no_repo,
-        allow_no_history=allow_no_history, model=model,
+        allow_no_history=allow_no_history, min_confidence=min_confidence,
     ))
+
+
+@cli.command("prepare-for-fetcher")
+@click.option("--output-db", type=click.Path(path_type=Path), default=Path("validated.db"),
+              help="Validation database (default: validated.db)")
+@click.option("--min-confidence", default=None, type=float,
+              help="Only include URLs with classifier confidence >= this (default: all)")
+def prepare_for_fetcher(output_db, min_confidence):
+    """Create a 'files' table in validated.db for github-data-file-fetcher.
+
+    The fetcher (fetch-repo-metadata, fetch-file-history) expects a 'files'
+    table with a 'url' column. This command populates it from the classifier
+    results so you can point the fetcher at validated.db.
+
+    Example:
+      skills-dataset prepare-for-fetcher --output-db data/validated.db
+      github-fetch fetch-repo-metadata --db data/validated.db
+      github-fetch fetch-file-history --db data/validated.db
+    """
+    from .filter.filter import open_db
+
+    conn = open_db(output_db)
+
+    # Drop and recreate to get fresh results
+    conn.execute("DROP TABLE IF EXISTS files")
+
+    where = """
+        has_frontmatter = 1
+        AND (heuristic_reject IS NULL OR heuristic_reject != 1)
+        AND classifier_is_skill = 1
+    """
+    if min_confidence is not None:
+        where += f" AND classifier_confidence >= {min_confidence}"
+
+    conn.execute(f"""
+        CREATE TABLE files AS
+        SELECT url FROM validation_results WHERE {where}
+    """)
+
+    count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    conf_msg = f" (confidence >= {min_confidence})" if min_confidence is not None else ""
+    print(f"Created 'files' table in {output_db}: {count:,} valid skill URLs{conf_msg}")
 
 
 if __name__ == "__main__":

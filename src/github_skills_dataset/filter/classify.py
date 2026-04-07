@@ -296,7 +296,7 @@ async def classify_pass(args):
         # Write results
         for i, (url, _, _, _, _) in enumerate(batch_data):
             conn.execute(
-                "UPDATE validation_results SET embedding_is_skill = ?, embedding_confidence = ? WHERE url = ?",
+                "UPDATE validation_results SET classifier_is_skill = ?, classifier_confidence = ? WHERE url = ?",
                 (int(preds[i]), round(float(confidences[i]), 4), url)
             )
 
@@ -310,7 +310,7 @@ async def classify_pass(args):
     conn = open_db(args.output_db)
     for t in [0.3, 0.5, 0.65, 0.8]:
         above = conn.execute(
-            "SELECT COUNT(*) FROM validation_results WHERE embedding_confidence >= ?", (t,)
+            "SELECT COUNT(*) FROM validation_results WHERE classifier_confidence >= ?", (t,)
         ).fetchone()[0]
         pct = above / total_classified * 100 if total_classified > 0 else 0
         print(f"  Confidence >= {t}: {above:,} ({pct:.0f}%)")

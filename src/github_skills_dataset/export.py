@@ -10,22 +10,33 @@ class MissingDataError(Exception):
     pass
 
 
-def load_valid_urls(validation_db: Path, model: str | None = None) -> pl.DataFrame:
+def load_valid_urls(validation_db: Path, min_confidence: float | None = None) -> pl.DataFrame:
     """Read validated URLs from the validation database.
 
-    If model is specified, only use that model's evaluations.
-    Otherwise, a URL is valid if any model marked it as a skill.
+    Uses the classifier results from validation_results. Excludes
+    heuristic rejects and files without frontmatter.
+
+    If min_confidence is specified, only include URLs with classifier
+    confidence >= that threshold. Otherwise includes all classifier-positive URLs.
     """
     conn = sqlite3.connect(validation_db)
-    if model:
+    if min_confidence is not None:
         df = pl.read_database(
-            "SELECT DISTINCT url FROM llm_skill_evaluation WHERE is_skill = 1 AND model = ?",
+            """SELECT url, classifier_confidence FROM validation_results
+               WHERE has_frontmatter = 1
+               AND (heuristic_reject IS NULL OR heuristic_reject != 1)
+               AND classifier_is_skill = 1
+               AND classifier_confidence >= ?""",
             conn,
-            execute_options={"parameters": [model]},
+            execute_options={"parameters": [min_confidence]},
         )
     else:
         df = pl.read_database(
-            "SELECT DISTINCT url FROM llm_skill_evaluation WHERE is_skill = 1", conn
+            """SELECT url, classifier_confidence FROM validation_results
+               WHERE has_frontmatter = 1
+               AND (heuristic_reject IS NULL OR heuristic_reject != 1)
+               AND classifier_is_skill = 1""",
+            conn,
         )
     conn.close()
     return df
@@ -117,10 +128,11 @@ def main(args):
     """Main export pipeline."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = getattr(args, 'model', None)
+    min_confidence = getattr(args, 'min_confidence', None)
     print("Loading valid URLs from validation DB...")
-    valid_urls_df = load_valid_urls(args.validation_db, model=model)
-    print(f"  {len(valid_urls_df):,} valid skill URLs" + (f" (model: {model})" if model else ""))
+    valid_urls_df = load_valid_urls(args.validation_db, min_confidence=min_confidence)
+    conf_msg = f" (confidence >= {min_confidence})" if min_confidence is not None else " (all)"
+    print(f"  {len(valid_urls_df):,} valid skill URLs{conf_msg}")
 
     print("Exporting files.parquet...")
     files_df = export_files(args.main_db, valid_urls_df, args.output_dir / "files.parquet")

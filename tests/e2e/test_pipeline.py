@@ -366,7 +366,7 @@ class TestPass3E2E:
 
         conn = open_db(env.output_db)
         classified = conn.execute(
-            "SELECT COUNT(*) FROM validation_results WHERE embedding_is_skill IS NOT NULL"
+            "SELECT COUNT(*) FROM validation_results WHERE classifier_is_skill IS NOT NULL"
         ).fetchone()[0]
         total_fm = conn.execute(
             "SELECT COUNT(*) FROM validation_results WHERE has_frontmatter = 1"
@@ -392,7 +392,7 @@ class TestPass3E2E:
         for name in ["skill-rebase", "skill-env"]:
             url = ALL_EXAMPLES[name][0]
             row = conn.execute(
-                "SELECT embedding_is_skill, embedding_confidence FROM validation_results WHERE url = ?",
+                "SELECT classifier_is_skill, classifier_confidence FROM validation_results WHERE url = ?",
                 (url,)
             ).fetchone()
             assert row is not None, f"{name} not found in results"
@@ -460,7 +460,7 @@ class TestFullPipelineE2E:
         # skills should be classified by pass 3
         for name in ["skill-rebase", "skill-env"]:
             row = conn.execute(
-                "SELECT embedding_is_skill, embedding_confidence FROM validation_results WHERE url = ?",
+                "SELECT classifier_is_skill, classifier_confidence FROM validation_results WHERE url = ?",
                 (ALL_EXAMPLES[name][0],)
             ).fetchone()
             assert row[0] == 1, f"{name} should be classified as skill"

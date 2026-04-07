@@ -112,7 +112,7 @@ class TestClassifyPass:
         )
 
     def test_classifies_all_urls(self, env):
-        """Pass 3 should write embedding_is_skill and embedding_confidence for all URLs."""
+        """Pass 3 should write classifier_is_skill and classifier_confidence for all URLs."""
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
             labeled_csv=env.csv_path, confidence_threshold=None,
@@ -120,7 +120,7 @@ class TestClassifyPass:
 
         conn = sqlite3.connect(env.output_db)
         classified = conn.execute(
-            "SELECT COUNT(*) FROM validation_results WHERE embedding_is_skill IS NOT NULL"
+            "SELECT COUNT(*) FROM validation_results WHERE classifier_is_skill IS NOT NULL"
         ).fetchone()[0]
         total = conn.execute("SELECT COUNT(*) FROM validation_results").fetchone()[0]
         conn.close()
@@ -136,7 +136,7 @@ class TestClassifyPass:
 
         conn = sqlite3.connect(env.output_db)
         rows = conn.execute(
-            "SELECT embedding_confidence FROM validation_results WHERE embedding_confidence IS NOT NULL"
+            "SELECT classifier_confidence FROM validation_results WHERE classifier_confidence IS NOT NULL"
         ).fetchall()
         conn.close()
 
@@ -153,10 +153,10 @@ class TestClassifyPass:
 
         conn = sqlite3.connect(env.output_db)
         skill_preds = conn.execute(
-            "SELECT COUNT(*) FROM validation_results WHERE url LIKE '%skill-%' AND embedding_is_skill = 1"
+            "SELECT COUNT(*) FROM validation_results WHERE url LIKE '%skill-%' AND classifier_is_skill = 1"
         ).fetchone()[0]
         reject_preds = conn.execute(
-            "SELECT COUNT(*) FROM validation_results WHERE url LIKE '%reject-%' AND embedding_is_skill = 0"
+            "SELECT COUNT(*) FROM validation_results WHERE url LIKE '%reject-%' AND classifier_is_skill = 0"
         ).fetchone()[0]
         conn.close()
 

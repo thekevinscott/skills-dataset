@@ -50,7 +50,7 @@ def open_db(output_db: Path) -> sqlite3.Connection:
     """Open DB with WAL mode and busy timeout."""
     conn = sqlite3.connect(output_db)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=120000")
     return conn
 
 
@@ -87,13 +87,20 @@ def init_output_db(output_db: Path):
             )
         """)
 
-    # --- validation_results: add pass 2-4 columns ---
+    # --- validation_results: add pass 2-3 columns ---
     vr_cols = {row[1] for row in conn.execute("PRAGMA table_info(validation_results)")}
+
+    # Migrate old column names
+    if "embedding_is_skill" in vr_cols and "classifier_is_skill" not in vr_cols:
+        conn.execute("ALTER TABLE validation_results RENAME COLUMN embedding_is_skill TO classifier_is_skill")
+        conn.execute("ALTER TABLE validation_results RENAME COLUMN embedding_confidence TO classifier_confidence")
+        vr_cols = {row[1] for row in conn.execute("PRAGMA table_info(validation_results)")}
+
     for col, typedef in [
         ("heuristic_reject", "BOOLEAN"),
         ("heuristic_reason", "TEXT"),
-        ("embedding_is_skill", "BOOLEAN"),
-        ("embedding_confidence", "REAL"),
+        ("classifier_is_skill", "BOOLEAN"),
+        ("classifier_confidence", "REAL"),
     ]:
         if col not in vr_cols:
             conn.execute(f"ALTER TABLE validation_results ADD COLUMN {col} {typedef}")
@@ -245,7 +252,7 @@ async def filter_pass2(args, to_validate=None):
     # Confident embedding predictions (above threshold)
     if confidence_threshold is not None:
         for row in out_conn.execute(
-            "SELECT url FROM validation_results WHERE embedding_confidence >= ?",
+            "SELECT url FROM validation_results WHERE classifier_confidence >= ?",
             (confidence_threshold,)
         ):
             skip_urls.add(row[0])

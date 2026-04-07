@@ -128,7 +128,7 @@ skills-dataset generate-training-data \
 After labeling, regenerate the training CSV and retrain:
 
 ```bash
-uv run python /tmp/gen_labeled_csv.py   # regenerate from DB
+skills-dataset regenerate-labels         # regenerate labeled.csv from DB
 skills-dataset filter-pass-3 ...         # retrain classifier
 ```
 
@@ -139,7 +139,13 @@ LLM backends:
 
 ## 5. Fetch metadata and history
 
-Run against the validated DB so we only fetch data for classified skills:
+First, prepare a `files` table in validated.db for the fetcher:
+
+```bash
+skills-dataset prepare-for-fetcher --output-db data/validated.db
+```
+
+Then run the fetcher against it:
 
 ```bash
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
@@ -176,8 +182,8 @@ cd build && kaggle datasets create -p . --dir-mode tar
 | `checked_at` | TIMESTAMP | When frontmatter was checked |
 | `heuristic_reject` | BOOLEAN | Pass 2: null=unchecked, 0=not rejected, 1=rejected |
 | `heuristic_reason` | TEXT | Why heuristic rejected it |
-| `embedding_is_skill` | BOOLEAN | Pass 3: classifier prediction |
-| `embedding_confidence` | REAL | Pass 3: 0.0 (uncertain) to 1.0 (confident) |
+| `classifier_is_skill` | BOOLEAN | Pass 3: classifier prediction |
+| `classifier_confidence` | REAL | Pass 3: 0.0 (uncertain) to 1.0 (confident) |
 
 ### `llm_skill_evaluation`
 
