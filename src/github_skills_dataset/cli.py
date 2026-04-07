@@ -186,35 +186,30 @@ def filter_valid_skills(main_db, output_db, content_dir, labeled_csv):
 @cli.command("generate-training-data")
 @_apply_options(_filter_common_options + _llm_options)
 @click.option("--limit", default=None, type=int,
-              help="Process at most N URLs (default: all)")
-@click.option("--confidence-threshold", default=0.5, type=float,
-              help="Send URLs with classifier confidence below this to the LLM (default: 0.5)")
+              help="Process at most N content hashes (default: all)")
+@click.option("--labeled-csv", type=click.Path(path_type=Path), default=Path("training/labeled.csv"),
+              help="Training data CSV (default: training/labeled.csv)")
 def generate_training_data(main_db, output_db, content_dir, model, base_url, concurrency, backend,
-                           limit, confidence_threshold):
-    """Send low-confidence URLs to an LLM for labeling.
+                           limit, labeled_csv):
+    """Send unlabeled files to an LLM for classification.
 
-    NOT part of the main pipeline. This command generates training data
-    to improve the classifier. It reads URLs where the SVM classifier
-    had low confidence (below --confidence-threshold), sends them to
-    the specified LLM backend, and stores results in llm_skill_evaluation.
+    NOT part of the main pipeline. Generates training data to improve
+    the classifier. Reads training/labeled.csv to skip already-labeled
+    content, sends the rest to the LLM, appends results to the CSV.
 
-    After running, regenerate labeled.csv and re-run filter-pass-3 to
-    retrain the classifier with the new labels.
-
-    Uses file-based caching (cachetta) to avoid re-classifying content
-    that has already been seen. Safe to interrupt and resume.
+    After running, re-run filter-pass-3 to retrain the classifier.
 
     Example workflow:
-      1. skills-dataset filter-valid-skills ...    # main pipeline
-      2. skills-dataset generate-training-data ... # label uncertain files
-      3. python /tmp/gen_labeled_csv.py            # regenerate CSV
-      4. skills-dataset filter-pass-3 ...          # retrain classifier
+      1. skills-dataset filter-valid-skills ...     # main pipeline
+      2. skills-dataset generate-training-data ...  # label new files
+      3. skills-dataset filter-pass-3 ...           # retrain
     """
-    from .filter import filter_pass2
-    asyncio.run(filter_pass2(_make_args(
+    from .filter.training import generate_training
+    asyncio.run(generate_training(_make_args(
         main_db=main_db, output_db=output_db, content_dir=content_dir,
+        labeled_csv=labeled_csv,
         model=model, base_url=base_url, concurrency=concurrency, backend=backend,
-        limit=limit, confidence_threshold=confidence_threshold,
+        limit=limit,
     )))
 
 
