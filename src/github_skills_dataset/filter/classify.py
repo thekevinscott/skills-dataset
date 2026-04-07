@@ -160,7 +160,6 @@ async def classify_pass(args):
     """Train SVM classifier on labeled data, predict on all files."""
     init_output_db(args.output_db)
     csv_path = Path(getattr(args, 'labeled_csv', 'data/labeled.csv'))
-    threshold = getattr(args, 'confidence_threshold', None)
 
     # Load labeled data with content
     labeled = load_labeled_csv(csv_path)
@@ -240,23 +239,6 @@ async def classify_pass(args):
     print(f"\nVal accuracy: {accuracy_score(y_val, y_pred)*100:.1f}%, macro-F1: {(f1_r+f1_s)/2:.3f}")
     print(classification_report(y_val, y_pred, target_names=["reject", "skill"]))
 
-    # Find confidence threshold
-    if threshold is None:
-        confidences = np.abs(y_prob - 0.5) * 2
-        for t in np.arange(0.0, 1.0, 0.05):
-            mask = confidences >= t
-            if mask.sum() < 5:
-                continue
-            acc = accuracy_score(y_val[mask], y_pred[mask])
-            coverage = mask.sum() / len(y_val)
-            if acc >= 0.95:
-                threshold = t
-                print(f"  Auto threshold: {t:.2f} (accuracy={acc*100:.1f}%, coverage={coverage*100:.0f}%)")
-                break
-        if threshold is None:
-            threshold = 0.5
-            print(f"  Could not find 95% threshold, using default: {threshold}")
-
     # Predict on all URLs with frontmatter and no heuristic reject
     conn = open_db(args.output_db)
     urls_to_classify = [
@@ -267,54 +249,69 @@ async def classify_pass(args):
     conn.close()
     print(f"\nPredicting on {len(urls_to_classify):,} URLs...")
 
-    # Build features for all URLs
-    url_features = []  # (url, content_truncated, heuristic_vec, url_vec, fmbow_vec)
-    for url in tqdm(urls_to_classify, desc="Pass 3: extract features", unit="url"):
-        parsed = parse_github_url(url)
-        if not parsed:
-            continue
-        owner, repo, ref, path = parsed
-        local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
-        if not local_path.exists():
-            continue
-        content = local_path.read_text(errors='replace')
-        url_features.append((
-            url,
-            content[:CONTENT_MAX_BYTES],
-            extract_heuristic_features(content, url),
-            extract_url_features(url),
-            _fm_bow_vector(content, fm_vocab),
-        ))
-
-    # TF-IDF transform
-    X_tfidf = tfidf.transform([uf[1] for uf in url_features]).toarray()
-    X_heur = np.array([uf[2] for uf in url_features])
-    X_url = np.array([uf[3] for uf in url_features])
-    X_fmbow = np.array([uf[4] for uf in url_features])
-    X_all = np.hstack([X_tfidf, X_heur, X_url, X_fmbow])
-
-    # Predict
-    probs = clf.predict_proba(X_all)[:, 1]
-    preds = (probs >= 0.5).astype(int)
-    confidences = np.abs(probs - 0.5) * 2
-
-    # Write results
+    # Predict in batches to avoid OOM (TF-IDF dense matrix is ~8GB for 960K URLs)
+    BATCH_SIZE = 10_000
     conn = open_db(args.output_db)
-    for i, (url, _, _, _, _) in enumerate(tqdm(url_features, desc="Pass 3: write results", unit="url")):
-        conn.execute(
-            "UPDATE validation_results SET embedding_is_skill = ?, embedding_confidence = ? WHERE url = ?",
-            (int(preds[i]), round(float(confidences[i]), 4), url)
-        )
-        if (i + 1) % 5000 == 0:
-            conn.commit()
-    conn.commit()
+    total_classified = 0
+    total_above = 0
+    total_below = 0
+
+    for batch_start in tqdm(range(0, len(urls_to_classify), BATCH_SIZE), desc="Pass 3: classify", unit="batch"):
+        batch_urls = urls_to_classify[batch_start:batch_start + BATCH_SIZE]
+
+        # Extract features for this batch
+        batch_data = []  # (url, content_trunc, heur_vec, url_vec, fmbow_vec)
+        for url in batch_urls:
+            parsed = parse_github_url(url)
+            if not parsed:
+                continue
+            owner, repo, ref, path = parsed
+            local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
+            if not local_path.exists():
+                continue
+            content = local_path.read_text(errors='replace')
+            batch_data.append((
+                url,
+                content[:CONTENT_MAX_BYTES],
+                extract_heuristic_features(content, url),
+                extract_url_features(url),
+                _fm_bow_vector(content, fm_vocab),
+            ))
+
+        if not batch_data:
+            continue
+
+        # Build feature matrix for batch
+        X_tfidf = tfidf.transform([bd[1] for bd in batch_data]).toarray()
+        X_heur = np.array([bd[2] for bd in batch_data])
+        X_url = np.array([bd[3] for bd in batch_data])
+        X_fmbow = np.array([bd[4] for bd in batch_data])
+        X_batch = np.hstack([X_tfidf, X_heur, X_url, X_fmbow])
+
+        # Predict
+        probs = clf.predict_proba(X_batch)[:, 1]
+        preds = (probs >= 0.5).astype(int)
+        confidences = np.abs(probs - 0.5) * 2
+
+        # Write results
+        for i, (url, _, _, _, _) in enumerate(batch_data):
+            conn.execute(
+                "UPDATE validation_results SET embedding_is_skill = ?, embedding_confidence = ? WHERE url = ?",
+                (int(preds[i]), round(float(confidences[i]), 4), url)
+            )
+
+        conn.commit()
+        total_classified += len(batch_data)
+
     conn.close()
 
-    # Report
-    above = int((confidences >= threshold).sum())
-    below = int((confidences < threshold).sum())
-    total = above + below
-    print(f"\n  Classified: {total:,}")
-    print(f"  Confidence threshold: {threshold}")
-    print(f"  Above threshold: {above:,} ({above/total*100:.0f}%)")
-    print(f"  Below threshold (need LLM): {below:,} ({below/total*100:.0f}%)")
+    # Report confidence distribution
+    print(f"\n  Classified: {total_classified:,}")
+    conn = open_db(args.output_db)
+    for t in [0.3, 0.5, 0.65, 0.8]:
+        above = conn.execute(
+            "SELECT COUNT(*) FROM validation_results WHERE embedding_confidence >= ?", (t,)
+        ).fetchone()[0]
+        pct = above / total_classified * 100 if total_classified > 0 else 0
+        print(f"  Confidence >= {t}: {above:,} ({pct:.0f}%)")
+    conn.close()
