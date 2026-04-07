@@ -74,3 +74,55 @@ def heuristic_reject(content: str) -> tuple[bool, str]:
 
     # Not rejected -- uncertain
     return False, ""
+
+
+async def heuristic_pass(args):
+    """Run heuristic rejection on all files with frontmatter.
+
+    Re-runs every time (rules may change). Sets heuristic_reject (0 or 1)
+    and heuristic_reason on validation_results.
+    """
+    from .filter import init_output_db, open_db, scan_content, resolve_content_path
+    from .parse_github_url import parse_github_url
+    from tqdm import tqdm
+
+    init_output_db(args.output_db)
+    _, to_validate, _ = scan_content(args)
+
+    conn = open_db(args.output_db)
+    has_fm = set(
+        row[0] for row in conn.execute(
+            "SELECT url FROM validation_results WHERE has_frontmatter = 1"
+        ).fetchall()
+    )
+    conn.close()
+
+    urls = [url for url in to_validate if url in has_fm]
+    print(f"  Running heuristics on {len(urls):,} URLs...")
+
+    conn = open_db(args.output_db)
+    rejected = 0
+    checked = 0
+    for url in tqdm(urls, desc="Pass 2: heuristics", unit="url"):
+        parsed = parse_github_url(url)
+        if not parsed:
+            continue
+        owner, repo, ref, path = parsed
+        local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
+        if not local_path.exists():
+            continue
+        content = local_path.read_text(errors='replace')
+        is_rejected, reason = heuristic_reject(content)
+        conn.execute(
+            "UPDATE validation_results SET heuristic_reject = ?, heuristic_reason = ? WHERE url = ?",
+            (1 if is_rejected else 0, reason if reason else None, url)
+        )
+        if is_rejected:
+            rejected += 1
+        checked += 1
+        if checked % 5000 == 0:
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+    print(f"  Checked: {checked:,}, Rejected: {rejected:,}")

@@ -116,53 +116,10 @@ def filter_pass2_cmd(main_db, output_db, content_dir):
     Sets heuristic_reject=1 for definite non-skills. heuristic_reject=0
     means "not rejected by heuristics" (uncertain, not confirmed skill).
     """
-    from .filter.heuristics import heuristic_reject
-    from .filter.filter import init_output_db, open_db, scan_content, resolve_content_path
-    from .filter.parse_github_url import parse_github_url
-    from tqdm import tqdm
-
-    init_output_db(output_db)
-    _, to_validate, _ = scan_content(_make_args(
+    from .filter.heuristics import heuristic_pass
+    asyncio.run(heuristic_pass(_make_args(
         main_db=main_db, output_db=output_db, content_dir=content_dir,
-    ))
-
-    conn = open_db(output_db)
-    has_fm = set(
-        row[0] for row in conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter = 1"
-        ).fetchall()
-    )
-    conn.close()
-
-    urls = [url for url in to_validate if url in has_fm]
-    print(f"  Running heuristics on {len(urls):,} URLs...")
-
-    conn = open_db(output_db)
-    rejected = 0
-    checked = 0
-    for url in tqdm(urls, desc="Pass 2: heuristics", unit="url"):
-        parsed = parse_github_url(url)
-        if not parsed:
-            continue
-        owner, repo, ref, path = parsed
-        local_path = resolve_content_path(content_dir, owner, repo, ref, path)
-        if not local_path.exists():
-            continue
-        content = local_path.read_text(errors='replace')
-        is_rejected, reason = heuristic_reject(content)
-        conn.execute(
-            "UPDATE validation_results SET heuristic_reject = ?, heuristic_reason = ? WHERE url = ?",
-            (1 if is_rejected else 0, reason if reason else None, url)
-        )
-        if is_rejected:
-            rejected += 1
-        checked += 1
-        if checked % 5000 == 0:
-            conn.commit()
-
-    conn.commit()
-    conn.close()
-    print(f"  Checked: {checked:,}, Rejected: {rejected:,}")
+    )))
 
 
 @cli.command("filter-pass-3")
@@ -204,11 +161,8 @@ def filter_valid_skills(main_db, output_db, content_dir, labeled_csv):
     confidence scores for downstream filtering.
     """
     from .filter import filter_pass1
+    from .filter.heuristics import heuristic_pass
     from .filter.classify import classify_pass
-    from .filter.heuristics import heuristic_reject
-    from .filter.filter import init_output_db, open_db, scan_content, resolve_content_path
-    from .filter.parse_github_url import parse_github_url
-    from tqdm import tqdm
 
     args_common = _make_args(main_db=main_db, output_db=output_db, content_dir=content_dir)
 
@@ -216,30 +170,7 @@ def filter_valid_skills(main_db, output_db, content_dir, labeled_csv):
     asyncio.run(filter_pass1(args_common))
 
     print("\n=== Pass 2: Heuristics ===")
-    _, to_validate, _ = scan_content(args_common)
-    conn = open_db(output_db)
-    has_fm = set(row[0] for row in conn.execute(
-        "SELECT url FROM validation_results WHERE has_frontmatter = 1"
-    ).fetchall())
-    conn.close()
-    urls = [url for url in to_validate if url in has_fm]
-    conn = open_db(output_db)
-    for url in tqdm(urls, desc="Pass 2: heuristics", unit="url"):
-        parsed = parse_github_url(url)
-        if not parsed:
-            continue
-        owner, repo, ref, path = parsed
-        local_path = resolve_content_path(content_dir, owner, repo, ref, path)
-        if not local_path.exists():
-            continue
-        content = local_path.read_text(errors='replace')
-        is_rejected, reason = heuristic_reject(content)
-        conn.execute(
-            "UPDATE validation_results SET heuristic_reject = ?, heuristic_reason = ? WHERE url = ?",
-            (1 if is_rejected else 0, reason if reason else None, url)
-        )
-    conn.commit()
-    conn.close()
+    asyncio.run(heuristic_pass(args_common))
 
     print("\n=== Pass 3: Classify ===")
     asyncio.run(classify_pass(_make_args(
@@ -421,6 +352,30 @@ def prepare_for_fetcher(output_db, min_confidence):
 
     conf_msg = f" (confidence >= {min_confidence})" if min_confidence is not None else ""
     print(f"Created 'files' table in {output_db}: {count:,} valid skill URLs{conf_msg}")
+
+
+@cli.command("hash")
+@click.argument("file", type=click.Path(exists=True, path_type=Path), required=False)
+@click.option("--text", default=None, help="Hash a text string (UTF-8 encoded) instead of a file")
+def hash_cmd(file, text):
+    """Compute the content hash of a file or text.
+
+    The hash is sha256 of raw bytes. For files, this matches sha256sum.
+    For --text, the string is UTF-8 encoded before hashing.
+
+    Examples:
+      skills-dataset hash SKILL.md
+      skills-dataset hash --text "---\\nname: test\\n---"
+      cat SKILL.md | skills-dataset hash /dev/stdin
+    """
+    from .hash import content_hash, content_hash_file
+
+    if text is not None:
+        print(content_hash(text.encode("utf-8")))
+    elif file is not None:
+        print(content_hash_file(file))
+    else:
+        raise click.UsageError("Provide a file path or --text")
 
 
 if __name__ == "__main__":
