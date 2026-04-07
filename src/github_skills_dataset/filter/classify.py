@@ -119,6 +119,21 @@ def extract_heuristic_features(content: str, url: str) -> list[float]:
     ]
 
 
+def extract_url_features(url: str) -> list[float]:
+    """Extract features from the URL itself."""
+    u = url.lower()
+    return [
+        1 if '.claude/skills' in u else 0,
+        1 if '.agents/skills' in u else 0,
+        1 if 'blog' in u else 0,
+        1 if '_posts' in u else 0,
+        1 if 'docs/' in u else 0,
+        1 if 'test' in u else 0,
+        1 if '/skills/' in u else 0,
+        u.count('/'),
+    ]
+
+
 def _build_fm_bow_vocab(examples_content: list[str]) -> list[str]:
     """Build vocabulary of frontmatter keys across all examples."""
     keys = set()
@@ -197,17 +212,20 @@ async def classify_pass(args):
     X_train_heur = np.array([extract_heuristic_features(ex["content"], ex["url"]) for ex in train])
     X_val_heur = np.array([extract_heuristic_features(ex["content"], ex["url"]) for ex in val])
 
+    X_train_url = np.array([extract_url_features(ex["url"]) for ex in train])
+    X_val_url = np.array([extract_url_features(ex["url"]) for ex in val])
+
     X_train_fmbow = np.array([_fm_bow_vector(ex["content"], fm_vocab) for ex in train])
     X_val_fmbow = np.array([_fm_bow_vector(ex["content"], fm_vocab) for ex in val])
 
-    X_train = np.hstack([X_train_tfidf, X_train_heur, X_train_fmbow])
-    X_val = np.hstack([X_val_tfidf, X_val_heur, X_val_fmbow])
+    X_train = np.hstack([X_train_tfidf, X_train_heur, X_train_url, X_train_fmbow])
+    X_val = np.hstack([X_val_tfidf, X_val_heur, X_val_url, X_val_fmbow])
     y_train = np.array([1 if ex["is_skill"] else 0 for ex in train])
     y_val = np.array([1 if ex["is_skill"] else 0 for ex in val])
 
-    print(f"  Features: {X_train.shape[1]} (TF-IDF={X_train_tfidf.shape[1]}, heuristic={X_train_heur.shape[1]}, FM BoW={X_train_fmbow.shape[1]})")
+    print(f"  Features: {X_train.shape[1]} (TF-IDF={X_train_tfidf.shape[1]}, heuristic={X_train_heur.shape[1]}, URL={X_train_url.shape[1]}, FM BoW={X_train_fmbow.shape[1]})")
 
-    # Train SVM
+    # Train SVM-rbf
     clf = Pipeline([
         ('scaler', StandardScaler()),
         ('svm', SVC(kernel='rbf', C=10, probability=True, class_weight='balanced')),
@@ -250,7 +268,7 @@ async def classify_pass(args):
     print(f"\nPredicting on {len(urls_to_classify):,} URLs...")
 
     # Build features for all URLs
-    url_features = []  # (url, content_truncated, heuristic_vec, fmbow_vec)
+    url_features = []  # (url, content_truncated, heuristic_vec, url_vec, fmbow_vec)
     for url in tqdm(urls_to_classify, desc="Pass 3: extract features", unit="url"):
         parsed = parse_github_url(url)
         if not parsed:
@@ -264,14 +282,16 @@ async def classify_pass(args):
             url,
             content[:CONTENT_MAX_BYTES],
             extract_heuristic_features(content, url),
+            extract_url_features(url),
             _fm_bow_vector(content, fm_vocab),
         ))
 
     # TF-IDF transform
     X_tfidf = tfidf.transform([uf[1] for uf in url_features]).toarray()
     X_heur = np.array([uf[2] for uf in url_features])
-    X_fmbow = np.array([uf[3] for uf in url_features])
-    X_all = np.hstack([X_tfidf, X_heur, X_fmbow])
+    X_url = np.array([uf[3] for uf in url_features])
+    X_fmbow = np.array([uf[4] for uf in url_features])
+    X_all = np.hstack([X_tfidf, X_heur, X_url, X_fmbow])
 
     # Predict
     probs = clf.predict_proba(X_all)[:, 1]
@@ -280,7 +300,7 @@ async def classify_pass(args):
 
     # Write results
     conn = open_db(args.output_db)
-    for i, (url, _, _, _) in enumerate(tqdm(url_features, desc="Pass 3: write results", unit="url")):
+    for i, (url, _, _, _, _) in enumerate(tqdm(url_features, desc="Pass 3: write results", unit="url")):
         conn.execute(
             "UPDATE validation_results SET embedding_is_skill = ?, embedding_confidence = ? WHERE url = ?",
             (int(preds[i]), round(float(confidences[i]), 4), url)
