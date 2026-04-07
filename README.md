@@ -34,7 +34,7 @@ content/ (fetched files)  ------>  filter-pass-2 (heuristics)
                         export (Parquet)    generate-training-data
                               |                   |
                               v                   v
-                        build/*.parquet    llm_skill_evaluation
+                        build/*.parquet    training/labeled.csv
                         (Kaggle dataset)   (improves classifier)
 ```
 
@@ -90,7 +90,7 @@ skills-dataset filter-pass-2 \
 
 ### Pass 3: SVM classifier
 
-Trains an SVM-rbf classifier on labeled data, predicts `is_skill` and `confidence` for all files. Processes in 10K batches (~2GB peak memory). Retrains from scratch every run (training is instant, labeled data may have changed).
+Trains an SVM-rbf classifier on labeled data, predicts `is_skill` for all files. Processes in 10K batches (~2GB peak memory). Retrains from scratch every run.
 
 Features: TF-IDF bigrams (1000) + heuristic features (51) + URL features (8) + frontmatter key bag-of-words.
 
@@ -112,7 +112,9 @@ skills-dataset filter-valid-skills \
 
 ## 4. Generate training data (optional, requires LLM)
 
-The classifier improves over time by labeling uncertain files with an LLM. This is **not** part of the main pipeline -- run it when you have LLM budget.
+The classifier improves over time by labeling new files with an LLM. This is **not** part of the main pipeline -- run it when you have LLM budget.
+
+Reads `training/labeled.csv` to skip already-labeled content hashes, sends unlabeled files to the LLM, appends results to the CSV.
 
 ```bash
 skills-dataset generate-training-data \
@@ -121,15 +123,15 @@ skills-dataset generate-training-data \
   --content-dir data/content \
   --backend claude-agent-sdk \
   --concurrency 8 \
-  --confidence-threshold 0.5 \
   --limit 5000
 ```
 
-After labeling, regenerate the training CSV and retrain:
+After labeling, retrain the classifier:
 
 ```bash
-skills-dataset regenerate-labels         # regenerate labeled.csv from DB
-skills-dataset filter-pass-3 ...         # retrain classifier
+skills-dataset filter-pass-3 \
+  --output-db data/validated.db \
+  --content-dir data/content
 ```
 
 LLM backends:
@@ -139,15 +141,11 @@ LLM backends:
 
 ## 5. Fetch metadata and history
 
-First, prepare a `files` table in validated.db for the fetcher:
+Prepare a `files` table in validated.db for the fetcher, then run:
 
 ```bash
 skills-dataset prepare-for-fetcher --output-db data/validated.db
-```
 
-Then run the fetcher against it:
-
-```bash
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
   github-fetch fetch-repo-metadata --db data/validated.db
 
@@ -171,6 +169,17 @@ skills-dataset export \
 cd build && kaggle datasets create -p . --dir-mode tar
 ```
 
+## Utilities
+
+### Content hash
+
+Compute the sha256 hash of a file (matches `sha256sum`):
+
+```bash
+skills-dataset hash SKILL.md
+skills-dataset hash --text "---\nname: test\n---"
+```
+
 ## Database schema
 
 ### `validation_results`
@@ -183,48 +192,35 @@ cd build && kaggle datasets create -p . --dir-mode tar
 | `heuristic_reject` | BOOLEAN | Pass 2: null=unchecked, 0=not rejected, 1=rejected |
 | `heuristic_reason` | TEXT | Why heuristic rejected it |
 | `classifier_is_skill` | BOOLEAN | Pass 3: classifier prediction |
-| `classifier_confidence` | REAL | Pass 3: 0.0 (uncertain) to 1.0 (confident) |
+| `classifier_confidence` | REAL | Pass 3: internal confidence score (stored, not exported) |
 
-### `llm_skill_evaluation`
+### `training/labeled.csv`
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `url` | TEXT | GitHub file URL |
-| `backend` | TEXT | API backend used (anthropic/openai/claude-agent-sdk) |
-| `model` | TEXT | Model name |
-| `base_url` | TEXT | API endpoint (null for Anthropic/agent SDK) |
-| `is_skill` | BOOLEAN | LLM classification |
-| `reason` | TEXT | LLM explanation |
-| `evaluated_at` | TIMESTAMP | When classified |
-| UNIQUE | | (url, backend, model) |
+Source of truth for classifier training. Checked into git. Format:
 
-## Confidence scores
+```
+# backend=claude-agent-sdk, model=claude-haiku-4-5-20251001
+content_hash,is_skill
+a1b2c3...,true
+d4e5f6...,false
+```
 
-The classifier assigns confidence 0.0-1.0 to every prediction. Downstream consumers choose their quality threshold:
-
-| Confidence >= | Accuracy | Coverage | Use case |
-|---------------|----------|----------|----------|
-| 0.0 (all) | ~90% | 100% | Maximum recall, ~1.4% noise |
-| 0.3 | ~92% | 92% | Balanced |
-| 0.5 | ~94% | 85% | High quality |
-| 0.65 | ~95% | 81% | Very high quality |
-| 0.8 | ~97% | 66% | Research-grade |
+Content hash is `sha256(raw_file_bytes)`. Deduped by content.
 
 ## Classifier performance
 
-With 1,371 labeled rejects and 65K labeled skills:
+With ~33K unique labeled content hashes (~684 rejects):
 
 - **10-fold CV macro-F1: 0.937** (SVM-rbf C=10)
-- **Holdout accuracy: 90%** (balanced val set)
-- **At confidence >= 0.5: 94.4% accuracy on 85% of data**
+- **Holdout accuracy: ~90%** (balanced val set)
 
-Performance improves with more labeled rejects. The `generate-training-data` command produces these.
+Performance improves with more labeled rejects. Run `generate-training-data` to produce these.
 
 ## Development
 
 ```bash
 uv sync --extra dev
-uv run pytest tests/              # all 40 tests
+uv run pytest tests/              # all 45 tests
 uv run pytest tests/integration/  # unit + integration
 uv run pytest tests/e2e/          # end-to-end pipeline
 ```

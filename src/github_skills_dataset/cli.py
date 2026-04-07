@@ -7,7 +7,7 @@ Pipeline:
   filter-valid-skills  Run all 3 passes in sequence
 
 Training data:
-  generate-training-data  Send low-confidence URLs to LLM for labeling
+  generate-training-data  Send unlabeled files to LLM for labeling
 
 Export:
   export               Export validated skills to Parquet for Kaggle
@@ -158,7 +158,7 @@ def filter_valid_skills(main_db, output_db, content_dir, labeled_csv):
 
     No LLM required. Runs frontmatter check, heuristic rejection, and
     SVM classification in sequence. Results written to --output-db with
-    confidence scores for downstream filtering.
+    Results written to --output-db.
     """
     from .filter import filter_pass1
     from .filter.heuristics import heuristic_pass
@@ -229,36 +229,25 @@ def generate_training_data(main_db, output_db, content_dir, model, base_url, con
               help="Allow export even if some valid files have no repo metadata")
 @click.option("--allow-no-history", is_flag=True, default=False,
               help="Allow export even if some valid files have no commit history")
-@click.option("--min-confidence", default=None, type=float,
-              help="Only export URLs with classifier confidence >= this (default: all)")
-def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history, min_confidence):
+def export(main_db, validation_db, output_dir, kaggle_username, allow_no_repo, allow_no_history):
     """Export validated skills to Parquet for Kaggle.
 
     Reads classification results from --validation-db and exports files,
-    repos, and history to Parquet format. Uses the SVM classifier results
-    (classifier_is_skill) from validation_results, excluding heuristic
-    rejects.
-
-    Use --min-confidence to filter by classifier confidence score:
-      0.0  = all predictions (~90% accuracy, ~1.4% noise)
-      0.3  = balanced (~92% accuracy)
-      0.5  = high quality (~94% accuracy)
-      0.65 = very high quality (~95% accuracy)
+    repos, and history to Parquet format. Includes all files classified
+    as skills by the SVM classifier, excluding heuristic rejects.
     """
     from .export import main as export_main
     export_main(_make_args(
         main_db=main_db, validation_db=validation_db, output_dir=output_dir,
         kaggle_username=kaggle_username, allow_no_repo=allow_no_repo,
-        allow_no_history=allow_no_history, min_confidence=min_confidence,
+        allow_no_history=allow_no_history,
     ))
 
 
 @cli.command("prepare-for-fetcher")
 @click.option("--output-db", type=click.Path(path_type=Path), default=Path("validated.db"),
               help="Validation database (default: validated.db)")
-@click.option("--min-confidence", default=None, type=float,
-              help="Only include URLs with classifier confidence >= this (default: all)")
-def prepare_for_fetcher(output_db, min_confidence):
+def prepare_for_fetcher(output_db):
     """Create a 'files' table in validated.db for github-data-file-fetcher.
 
     The fetcher (fetch-repo-metadata, fetch-file-history) expects a 'files'
@@ -273,29 +262,19 @@ def prepare_for_fetcher(output_db, min_confidence):
     from .filter.filter import open_db
 
     conn = open_db(output_db)
-
-    # Drop and recreate to get fresh results
     conn.execute("DROP TABLE IF EXISTS files")
-
-    where = """
-        has_frontmatter = 1
+    conn.execute("""
+        CREATE TABLE files AS
+        SELECT url FROM validation_results
+        WHERE has_frontmatter = 1
         AND (heuristic_reject IS NULL OR heuristic_reject != 1)
         AND classifier_is_skill = 1
-    """
-    if min_confidence is not None:
-        where += f" AND classifier_confidence >= {min_confidence}"
-
-    conn.execute(f"""
-        CREATE TABLE files AS
-        SELECT url FROM validation_results WHERE {where}
     """)
 
     count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     conn.commit()
     conn.close()
-
-    conf_msg = f" (confidence >= {min_confidence})" if min_confidence is not None else ""
-    print(f"Created 'files' table in {output_db}: {count:,} valid skill URLs{conf_msg}")
+    print(f"Created 'files' table in {output_db}: {count:,} valid skill URLs")
 
 
 @cli.command("hash")
