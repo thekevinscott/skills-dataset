@@ -2,6 +2,7 @@
 
 import asyncio
 import csv
+import hashlib
 import sqlite3
 import types
 from pathlib import Path
@@ -49,14 +50,25 @@ class TestLoadLabeledCSV:
         csv_path = tmp_path / "labeled.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["url", "is_skill"])
-            writer.writerow(["https://github.com/org/repo/blob/main/SKILL.md", "true"])
-            writer.writerow(["https://github.com/org/repo2/blob/main/SKILL.md", "false"])
+            writer.writerow(["content_hash", "is_skill"])
+            writer.writerow(["abc123", "true"])
+            writer.writerow(["def456", "false"])
 
         examples = load_labeled_csv(csv_path)
         assert len(examples) == 2
+        assert examples[0]["content_hash"] == "abc123"
         assert examples[0]["is_skill"] is True
         assert examples[1]["is_skill"] is False
+
+    def test_skips_comments(self, tmp_path):
+        csv_path = tmp_path / "labeled.csv"
+        with open(csv_path, "w") as f:
+            f.write("# backend=test, model=test\n")
+            f.write("content_hash,is_skill\n")
+            f.write("abc123,true\n")
+
+        examples = load_labeled_csv(csv_path)
+        assert len(examples) == 1
 
 
 class TestClassifyPass:
@@ -67,9 +79,9 @@ class TestClassifyPass:
         output_db = tmp_path / "validated.db"
         content_dir = tmp_path / "content"
 
-        # Create enough examples for train/val split (need at least 10)
-        skills = [(make_url("org", f"skill-{i}"), VALID_SKILL) for i in range(20)]
-        rejects = [(make_url("org", f"reject-{i}"), NOT_A_SKILL) for i in range(20)]
+        # Create enough examples with varied content for train/val split
+        skills = [(make_url("org", f"skill-{i}"), f"---\nname: skill-{i}\ndescription: Skill number {i}\n---\n\n# Skill {i}\n\n## When to use\nUse this skill for task {i}.\n\n## Steps\n1. Do thing {i}\n2. Verify\n3. Done") for i in range(20)]
+        rejects = [(make_url("org", f"reject-{i}"), f"---\ntitle: Blog Post {i}\ndate: 2024-01-{i+1:02d}\ncategories: [python]\n---\n\n# Blog Post {i}\n\nThis is blog post number {i} about Python decorators and how to use them effectively in your projects.") for i in range(20)]
         all_examples = skills + rejects
 
         # Source DB
@@ -88,15 +100,17 @@ class TestClassifyPass:
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content)
 
-        # Labeled CSV
+        # Labeled CSV (content_hash, is_skill) -- hash raw bytes as written to disk
         csv_path = tmp_path / "labeled.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["url", "is_skill"])
+            writer.writerow(["content_hash", "is_skill"])
             for url, content in skills:
-                writer.writerow([url, "true"])
+                ch = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                writer.writerow([ch, "true"])
             for url, content in rejects:
-                writer.writerow([url, "false"])
+                ch = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                writer.writerow([ch, "false"])
 
         # Init DB with pass 1 results
         init_output_db(output_db)
@@ -115,7 +129,7 @@ class TestClassifyPass:
         """Pass 3 should write classifier_is_skill and classifier_confidence for all URLs."""
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
-            labeled_csv=env.csv_path, confidence_threshold=None,
+            labeled_csv=env.csv_path,
         )))
 
         conn = sqlite3.connect(env.output_db)
@@ -131,7 +145,7 @@ class TestClassifyPass:
         """Confidence scores should be between 0 and 1."""
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
-            labeled_csv=env.csv_path, confidence_threshold=None,
+            labeled_csv=env.csv_path,
         )))
 
         conn = sqlite3.connect(env.output_db)
@@ -148,7 +162,7 @@ class TestClassifyPass:
         """With clear skill vs non-skill examples, classifier should separate them."""
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
-            labeled_csv=env.csv_path, confidence_threshold=None,
+            labeled_csv=env.csv_path,
         )))
 
         conn = sqlite3.connect(env.output_db)

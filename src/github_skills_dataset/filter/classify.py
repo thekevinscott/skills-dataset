@@ -21,15 +21,14 @@ from .parse_github_url import parse_github_url
 
 
 def load_labeled_csv(csv_path: Path) -> list[dict]:
-    """Load labeled examples from CSV. Skips comment lines (# ...)."""
+    """Load labeled examples from CSV (content_hash,is_skill). Skips comment lines."""
     examples = []
     with open(csv_path) as f:
-        # Skip comment lines
         lines = [line for line in f if not line.startswith('#')]
     reader = csv.DictReader(lines)
     for row in reader:
         examples.append({
-            "url": row["url"],
+            "content_hash": row["content_hash"],
             "is_skill": row["is_skill"].lower() == "true",
         })
     return examples
@@ -164,21 +163,49 @@ async def classify_pass(args):
     init_output_db(args.output_db)
     csv_path = Path(getattr(args, 'labeled_csv', 'training/labeled.csv'))
 
-    # Load labeled data with content
+    # Load labels (content_hash -> is_skill)
     labeled = load_labeled_csv(csv_path)
-    print(f"Labeled examples: {len(labeled):,}")
+    labels_by_hash = {ex["content_hash"]: ex["is_skill"] for ex in labeled}
+    print(f"Labeled content hashes: {len(labels_by_hash):,}")
 
-    labeled_with_content = []
-    for ex in labeled:
-        parsed = parse_github_url(ex["url"])
+    # Build content_hash -> content for labeled examples only (scan disk for matches)
+    from ..hash import content_hash_file
+    from tqdm import tqdm as tqdm_sync
+
+    conn = open_db(args.output_db)
+    urls_with_fm = [
+        row[0] for row in conn.execute(
+            "SELECT url FROM validation_results WHERE has_frontmatter = 1"
+        ).fetchall()
+    ]
+    conn.close()
+
+    hash_to_content = {}  # only for labeled hashes
+    url_to_hash = {}  # all URLs -> hash (for prediction phase)
+
+    for url in tqdm_sync(urls_with_fm, desc="Pass 3: scan content", unit="url"):
+        parsed = parse_github_url(url)
         if not parsed:
             continue
         owner, repo, ref, path = parsed
         local_path = resolve_content_path(args.content_dir, owner, repo, ref, path)
         if not local_path.exists():
             continue
-        content = local_path.read_text(errors='replace')
-        labeled_with_content.append({**ex, "content": content})
+        ch = content_hash_file(local_path)
+        url_to_hash[url] = ch
+        # Only read full content for labeled hashes (saves memory)
+        if ch in labels_by_hash and ch not in hash_to_content:
+            hash_to_content[ch] = local_path.read_text(errors='replace')
+
+    # Join labels with content
+    labeled_with_content = []
+    for ch, is_skill in labels_by_hash.items():
+        if ch in hash_to_content:
+            labeled_with_content.append({
+                "content_hash": ch,
+                "content": hash_to_content[ch],
+                "is_skill": is_skill,
+            })
 
     print(f"  With content on disk: {len(labeled_with_content):,}")
 
@@ -203,7 +230,7 @@ async def classify_pass(args):
     print(f"  Val (balanced): {len(val)} ({val_neg_count} pos, {val_neg_count} neg)")
     print(f"  Train (downsampled): {len(train)} ({len(train_down_pos)} pos, {len(train_neg)} neg)")
 
-    # Build features
+    # Build features (no URL features for training -- CSV has no URLs)
     all_content = [ex["content"] for ex in labeled_with_content]
     fm_vocab = _build_fm_bow_vocab(all_content)
 
@@ -211,11 +238,12 @@ async def classify_pass(args):
     X_train_tfidf = tfidf.fit_transform([ex["content"][:CONTENT_MAX_BYTES] for ex in train]).toarray()
     X_val_tfidf = tfidf.transform([ex["content"][:CONTENT_MAX_BYTES] for ex in val]).toarray()
 
-    X_train_heur = np.array([extract_heuristic_features(ex["content"], ex["url"]) for ex in train])
-    X_val_heur = np.array([extract_heuristic_features(ex["content"], ex["url"]) for ex in val])
+    # Use empty URL for training (no URLs in CSV)
+    X_train_heur = np.array([extract_heuristic_features(ex["content"], "") for ex in train])
+    X_val_heur = np.array([extract_heuristic_features(ex["content"], "") for ex in val])
 
-    X_train_url = np.array([extract_url_features(ex["url"]) for ex in train])
-    X_val_url = np.array([extract_url_features(ex["url"]) for ex in val])
+    X_train_url = np.array([extract_url_features("") for _ in train])
+    X_val_url = np.array([extract_url_features("") for _ in val])
 
     X_train_fmbow = np.array([_fm_bow_vector(ex["content"], fm_vocab) for ex in train])
     X_val_fmbow = np.array([_fm_bow_vector(ex["content"], fm_vocab) for ex in val])
@@ -243,13 +271,16 @@ async def classify_pass(args):
     print(classification_report(y_val, y_pred, target_names=["reject", "skill"]))
 
     # Predict on all URLs with frontmatter and no heuristic reject
+    # (url_to_hash already has all frontmatter URLs; filter out heuristic rejects)
     conn = open_db(args.output_db)
-    urls_to_classify = [
+    heuristic_rejects = set(
         row[0] for row in conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter = 1 AND (heuristic_reject IS NULL OR heuristic_reject != 1)"
+            "SELECT url FROM validation_results WHERE heuristic_reject = 1"
         ).fetchall()
-    ]
+    )
     conn.close()
+
+    urls_to_classify = [url for url in url_to_hash if url not in heuristic_rejects]
     print(f"\nPredicting on {len(urls_to_classify):,} URLs...")
 
     # Predict in batches to avoid OOM (TF-IDF dense matrix is ~8GB for 960K URLs)

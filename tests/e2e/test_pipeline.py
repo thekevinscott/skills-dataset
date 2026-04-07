@@ -214,51 +214,62 @@ def pipeline_env(tmp_path):
     output_db = tmp_path / "validated.db"
     content_dir = tmp_path / "content"
 
-    # Source DB
-    conn = sqlite3.connect(main_db)
-    conn.execute("CREATE TABLE files (url TEXT PRIMARY KEY)")
+    # Content on disk for base examples
+    all_urls = []
     for name, (url, content, _) in ALL_EXAMPLES.items():
-        conn.execute("INSERT INTO files (url) VALUES (?)", (url,))
-    conn.commit()
-    conn.close()
-
-    # Content on disk
-    for name, (url, content, _) in ALL_EXAMPLES.items():
+        all_urls.append(url)
         parts = url.split("/")
         owner, repo, ref, path = parts[3], parts[4], parts[6], "/".join(parts[7:])
         fp = content_dir / owner / repo / "blob" / ref / path
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
 
-    # Labeled CSV (for classifier training -- need enough examples)
-    # Duplicate the examples to have enough for train/val split
+    # Labeled CSV (content_hash, is_skill) -- need enough varied examples
+    import hashlib
     csv_path = tmp_path / "labeled.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["url", "is_skill"])
+        writer.writerow(["content_hash", "is_skill"])
         for name, (url, content, is_skill) in ALL_EXAMPLES.items():
-            writer.writerow([url, "true" if is_skill else "false"])
-        # Add duplicated examples -- more skills than rejects to match real distribution
+            ch = hashlib.sha256(content.encode('utf-8')).hexdigest()
+            writer.writerow([ch, "true" if is_skill else "false"])
+        # Add varied content -- also register in source DB
+        extra_urls = []
         for i in range(30):
             for name in ["skill-rebase", "skill-env"]:
-                url, content, is_skill = ALL_EXAMPLES[name]
-                new_url = url.replace("/org/", f"/org-{i}/")
-                writer.writerow([new_url, "true"])
+                _, base_content, _ = ALL_EXAMPLES[name]
+                varied = base_content + f"\n\n<!-- variant {i} -->"
+                new_url = ALL_EXAMPLES[name][0].replace("/org/", f"/org-{i}/")
+                ch = hashlib.sha256(varied.encode('utf-8')).hexdigest()
+                writer.writerow([ch, "true"])
+                extra_urls.append(new_url)
                 parts = new_url.split("/")
                 owner, repo, ref, path = parts[3], parts[4], parts[6], "/".join(parts[7:])
                 fp = content_dir / owner / repo / "blob" / ref / path
                 fp.parent.mkdir(parents=True, exist_ok=True)
-                fp.write_text(content)
+                fp.write_text(varied)
         for i in range(10):
             for name in ["blog", "arxiv", "injection", "issue-tpl", "commercial"]:
-                url, content, is_skill = ALL_EXAMPLES[name]
-                new_url = url.replace("/org/", f"/org-{i}/")
-                writer.writerow([new_url, "false"])
+                _, base_content, _ = ALL_EXAMPLES[name]
+                varied = base_content + f"\n\n<!-- variant {i} -->"
+                new_url = ALL_EXAMPLES[name][0].replace("/org/", f"/org-{i}/")
+                ch = hashlib.sha256(varied.encode('utf-8')).hexdigest()
+                writer.writerow([ch, "false"])
+                extra_urls.append(new_url)
                 parts = new_url.split("/")
                 owner, repo, ref, path = parts[3], parts[4], parts[6], "/".join(parts[7:])
                 fp = content_dir / owner / repo / "blob" / ref / path
                 fp.parent.mkdir(parents=True, exist_ok=True)
-                fp.write_text(content)
+                fp.write_text(varied)
+
+    # Source DB -- all URLs (base + extras)
+    all_urls.extend(extra_urls)
+    db_conn = sqlite3.connect(main_db)
+    db_conn.execute("CREATE TABLE files (url TEXT PRIMARY KEY)")
+    for url in all_urls:
+        db_conn.execute("INSERT OR IGNORE INTO files (url) VALUES (?)", (url,))
+    db_conn.commit()
+    db_conn.close()
 
     return types.SimpleNamespace(
         main_db=main_db, output_db=output_db, content_dir=content_dir,
@@ -361,7 +372,7 @@ class TestPass3E2E:
         # Run pass 3 (classifier)
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
-            labeled_csv=env.csv_path, confidence_threshold=None,
+            labeled_csv=env.csv_path,
         )))
 
         conn = open_db(env.output_db)
@@ -385,7 +396,7 @@ class TestPass3E2E:
         )))
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
-            labeled_csv=env.csv_path, confidence_threshold=None,
+            labeled_csv=env.csv_path,
         )))
 
         conn = open_db(env.output_db)
@@ -436,7 +447,7 @@ class TestFullPipelineE2E:
         # Pass 3
         asyncio.run(classify_pass(types.SimpleNamespace(
             output_db=env.output_db, content_dir=env.content_dir,
-            labeled_csv=env.csv_path, confidence_threshold=None,
+            labeled_csv=env.csv_path,
         )))
 
         # Verify final state
