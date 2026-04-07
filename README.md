@@ -56,55 +56,27 @@ The `--graphql` flag batches 50 files per query (~50x faster than REST).
 
 ## 3. Classify skills
 
-### Pass 1: Frontmatter check
-
-Rejects files without valid YAML frontmatter. Results cached in DB -- re-runs skip already-checked URLs. ~50s on warm run.
+Three passes: frontmatter check, heuristic rejection, SVM classifier. See [docs/classification.md](docs/classification.md) for details.
 
 ```bash
-skills-dataset filter-pass-1 \
+# Individual passes
+uv run skills-dataset filter-pass-1 \
   --main-db data/skills.db \
   --output-db data/validated.db \
   --content-dir data/content
-```
 
-### Pass 2: Heuristic rejection
-
-Deterministic rules catch definite non-skills. Re-runs every time (~6 min for 965K files). Sets `heuristic_reject=1` for rejects.
-
-Rules:
-- Prompt injection patterns (`<agent-activation>`)
-- Academic papers (skillXiv engine, arxiv URLs)
-- Blog posts (title + date + categories, no name field)
-- GitHub issue templates (about + labels + assignees)
-- Commercial content (price/revenue fields)
-- Non-Claude platforms (platform field not containing "claude")
-- Empty body (< 50 chars after frontmatter)
-- Tool documentation cards (emoji + github_url + triggers, no name)
-
-```bash
-skills-dataset filter-pass-2 \
+uv run skills-dataset filter-pass-2 \
   --main-db data/skills.db \
   --output-db data/validated.db \
   --content-dir data/content
-```
 
-### Pass 3: SVM classifier
-
-Trains an SVM-rbf classifier on labeled data, predicts `is_skill` for all files. Processes in 10K batches (~2GB peak memory). Retrains from scratch every run.
-
-Features: TF-IDF bigrams (1000) + heuristic features (51) + URL features (8) + frontmatter key bag-of-words.
-
-```bash
-skills-dataset filter-pass-3 \
+uv run skills-dataset filter-pass-3 \
   --output-db data/validated.db \
   --content-dir data/content \
   --labeled-csv training/labeled.csv
-```
 
-### Combined (all 3 passes)
-
-```bash
-skills-dataset filter-valid-skills \
+# Or all 3 at once
+uv run skills-dataset filter-valid-skills \
   --main-db data/skills.db \
   --output-db data/validated.db \
   --content-dir data/content
@@ -115,7 +87,7 @@ skills-dataset filter-valid-skills \
 Prepare a `files` table in validated.db for the fetcher, then run:
 
 ```bash
-skills-dataset prepare-for-fetcher --output-db data/validated.db
+uv run skills-dataset prepare-for-fetcher --output-db data/validated.db
 
 uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
   github-fetch fetch-repo-metadata --db data/validated.db
@@ -127,7 +99,7 @@ uvx --from git+https://github.com/thekevinscott/github-data-file-fetcher \
 ## 5. Export to Parquet
 
 ```bash
-skills-dataset export \
+uv run skills-dataset export \
   --main-db data/skills.db \
   --validation-db data/validated.db \
   --output-dir build/ \
@@ -147,8 +119,8 @@ cd build && kaggle datasets create -p . --dir-mode tar
 Compute the sha256 hash of a file (matches `sha256sum`):
 
 ```bash
-skills-dataset hash SKILL.md
-skills-dataset hash --text "---\nname: test\n---"
+uv run skills-dataset hash SKILL.md
+uv run skills-dataset hash --text "---\nname: test\n---"
 ```
 
 ## Database schema
@@ -192,7 +164,7 @@ Performance improves with more labeled rejects. Run `generate-training-data` to 
 The classifier improves over time by labeling new files with an LLM. This is separate from the main pipeline -- run it when you have LLM budget.
 
 ```bash
-skills-dataset generate-training-data \
+uv run skills-dataset generate-training-data \
   --main-db data/skills.db \
   --output-db data/validated.db \
   --content-dir data/content \
@@ -204,7 +176,7 @@ skills-dataset generate-training-data \
 This reads `training/labeled.csv` to skip already-labeled content, sends unlabeled files to the LLM, and appends results to the CSV. After labeling, retrain the classifier:
 
 ```bash
-skills-dataset filter-pass-3 \
+uv run skills-dataset filter-pass-3 \
   --output-db data/validated.db \
   --content-dir data/content
 ```
