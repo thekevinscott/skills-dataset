@@ -14,11 +14,20 @@ def validation_db(tmp_path):
     db = tmp_path / "validated.db"
     init_output_db(db)
     conn = sqlite3.connect(db)
-    # Skills
+    # Ensure file_history table exists
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_history (url TEXT PRIMARY KEY, commits TEXT, fetched_at TEXT)"
+    )
+    # Skills (with history)
     for i in range(10):
+        url = f"https://github.com/org/skill-{i}/blob/main/SKILL.md"
         conn.execute(
             "INSERT INTO validation_results (url, has_frontmatter, classifier_is_skill, classifier_confidence) VALUES (?, 1, 1, ?)",
-            (f"https://github.com/org/skill-{i}/blob/main/SKILL.md", 0.9)
+            (url, 0.9)
+        )
+        conn.execute(
+            "INSERT INTO file_history (url, commits, fetched_at) VALUES (?, '[]', '2026-04-15')",
+            (url,)
         )
     # Rejects
     for i in range(5):
@@ -35,6 +44,11 @@ def validation_db(tmp_path):
     conn.execute(
         "INSERT INTO validation_results (url, has_frontmatter) VALUES (?, 0)",
         ("https://github.com/org/no-fm/blob/main/SKILL.md",)
+    )
+    # Skill WITHOUT history (should be excluded)
+    conn.execute(
+        "INSERT INTO validation_results (url, has_frontmatter, classifier_is_skill, classifier_confidence) VALUES (?, 1, 1, ?)",
+        ("https://github.com/org/no-history/blob/main/SKILL.md", 0.95)
     )
     conn.commit()
     conn.close()
@@ -65,3 +79,8 @@ class TestLoadValidUrls:
         df = load_valid_urls(validation_db)
         assert "url" in df.columns
         assert len(df.columns) == 1  # only url, no confidence
+
+    def test_excludes_files_without_history(self, validation_db):
+        df = load_valid_urls(validation_db)
+        urls = df["url"].to_list()
+        assert "https://github.com/org/no-history/blob/main/SKILL.md" not in urls

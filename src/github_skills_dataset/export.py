@@ -19,10 +19,11 @@ def load_valid_urls(validation_db: Path) -> pl.DataFrame:
     """
     conn = sqlite3.connect(validation_db)
     df = pl.read_database(
-        """SELECT url FROM validation_results
-           WHERE has_frontmatter = 1
-           AND (heuristic_reject IS NULL OR heuristic_reject != 1)
-           AND classifier_is_skill = 1""",
+        """SELECT vr.url FROM validation_results vr
+           INNER JOIN file_history fh ON vr.url = fh.url
+           WHERE vr.has_frontmatter = 1
+           AND (vr.heuristic_reject IS NULL OR vr.heuristic_reject != 1)
+           AND vr.classifier_is_skill = 1""",
         conn,
     )
     conn.close()
