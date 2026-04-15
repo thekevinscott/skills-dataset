@@ -48,11 +48,11 @@ def export_files(main_db: Path, valid_urls_df: pl.DataFrame, output_path: Path):
     return df
 
 
-def export_repos(main_db: Path, files_df: pl.DataFrame, output_path: Path, *, allow_missing: bool = False):
+def export_repos(validation_db: Path, files_df: pl.DataFrame, output_path: Path, *, allow_missing: bool = False):
     """Export repos.parquet. Raises MissingDataError if repos are missing unless allow_missing."""
     needed_keys = files_df.select("repo_key").unique()
 
-    conn = sqlite3.connect(main_db)
+    conn = sqlite3.connect(validation_db)
     repos_df = pl.read_database("SELECT * FROM repo_metadata", conn)
     conn.close()
 
@@ -78,11 +78,11 @@ def export_repos(main_db: Path, files_df: pl.DataFrame, output_path: Path, *, al
     return len(repos_df)
 
 
-def export_history(main_db: Path, files_df: pl.DataFrame, output_path: Path, *, allow_missing: bool = False):
+def export_history(validation_db: Path, files_df: pl.DataFrame, output_path: Path, *, allow_missing: bool = False):
     """Export history.parquet. Raises MissingDataError if history is missing unless allow_missing."""
     file_urls = files_df.select("url")
 
-    conn = sqlite3.connect(main_db)
+    conn = sqlite3.connect(validation_db)
     history_df = pl.read_database("SELECT url, commits FROM file_history", conn)
     conn.close()
 
@@ -127,14 +127,14 @@ def main(args):
 
     print("Exporting repos.parquet...")
     repos_count = export_repos(
-        args.main_db, files_df, args.output_dir / "repos.parquet",
+        args.validation_db, files_df, args.output_dir / "repos.parquet",
         allow_missing=args.allow_no_repo,
     )
     print(f"  {repos_count:,} repos")
 
     print("Exporting history.parquet...")
     history_count = export_history(
-        args.main_db, files_df, args.output_dir / "history.parquet",
+        args.validation_db, files_df, args.output_dir / "history.parquet",
         allow_missing=args.allow_no_history,
     )
     print(f"  {history_count:,} history entries")
