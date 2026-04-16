@@ -26,8 +26,8 @@ def validation_db(tmp_path):
             (url, 0.9)
         )
         conn.execute(
-            "INSERT INTO file_history (url, commits, fetched_at) VALUES (?, '[]', '2026-04-15')",
-            (url,)
+            "INSERT INTO file_history (url, commits, fetched_at) VALUES (?, ?, '2026-04-15')",
+            (url, '[{"sha":"abc","author":"x","date":"2026-01-01","message":"init"}]')
         )
     # Rejects
     for i in range(5):
@@ -49,6 +49,16 @@ def validation_db(tmp_path):
     conn.execute(
         "INSERT INTO validation_results (url, has_frontmatter, classifier_is_skill, classifier_confidence) VALUES (?, 1, 1, ?)",
         ("https://github.com/org/no-history/blob/main/SKILL.md", 0.95)
+    )
+    # Skill with EMPTY commits (should be excluded)
+    empty_url = "https://github.com/org/empty-history/blob/main/SKILL.md"
+    conn.execute(
+        "INSERT INTO validation_results (url, has_frontmatter, classifier_is_skill, classifier_confidence) VALUES (?, 1, 1, ?)",
+        (empty_url, 0.95)
+    )
+    conn.execute(
+        "INSERT INTO file_history (url, commits, fetched_at) VALUES (?, '[]', '2026-04-15')",
+        (empty_url,)
     )
     conn.commit()
     conn.close()
@@ -84,3 +94,8 @@ class TestLoadValidUrls:
         df = load_valid_urls(validation_db)
         urls = df["url"].to_list()
         assert "https://github.com/org/no-history/blob/main/SKILL.md" not in urls
+
+    def test_excludes_files_with_empty_history(self, validation_db):
+        df = load_valid_urls(validation_db)
+        urls = df["url"].to_list()
+        assert "https://github.com/org/empty-history/blob/main/SKILL.md" not in urls

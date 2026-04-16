@@ -23,7 +23,8 @@ def load_valid_urls(validation_db: Path) -> pl.DataFrame:
            INNER JOIN file_history fh ON vr.url = fh.url
            WHERE vr.has_frontmatter = 1
            AND (vr.heuristic_reject IS NULL OR vr.heuristic_reject != 1)
-           AND vr.classifier_is_skill = 1""",
+           AND vr.classifier_is_skill = 1
+           AND fh.commits != '[]'""",
         conn,
     )
     conn.close()
