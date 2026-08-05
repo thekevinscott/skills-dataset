@@ -38,6 +38,28 @@ content/ (fetched files)  ------>  filter-pass-2 (heuristics)
                         (Kaggle dataset)   (improves classifier)
 ```
 
+## Quick start
+
+`scripts/build-dataset.sh` runs steps 1-5 end to end with the default paths below:
+
+```bash
+scripts/build-dataset.sh --kaggle-username yourname
+```
+
+Every step is resumable -- the fetcher skips what's already in the DB, and the
+classifier passes are safe to re-run. If something dies, resume at that step:
+
+```bash
+scripts/build-dataset.sh --from classify     # steps: paths content classify metadata export upload
+scripts/build-dataset.sh --only export
+scripts/build-dataset.sh --dry-run           # print commands without running them
+```
+
+The Kaggle upload (step 6) is opt-in via `--upload`. Training data generation is
+deliberately excluded -- it costs LLM budget and is offline work (see [Training](#training)).
+
+The individual steps are documented below.
+
 ## 1. Fetch file paths
 
 ```bash
