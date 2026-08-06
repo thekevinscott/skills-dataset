@@ -46,8 +46,10 @@ content/ (fetched files)  ------>  filter-pass-2 (heuristics)
 scripts/build-dataset.sh --kaggle-username yourname
 ```
 
-Every step is resumable -- the fetcher skips what's already in the DB, and the
-classifier passes are safe to re-run. If something dies, resume at that step:
+It prompts before each step (steps are long and some are expensive); pass `--yes`
+to run unattended. Every step is resumable -- the fetcher skips what's already in
+the DB, and the classifier passes are safe to re-run. If something dies, resume
+at that step:
 
 ```bash
 scripts/build-dataset.sh --from classify     # steps: paths content classify metadata export upload
@@ -57,6 +59,21 @@ scripts/build-dataset.sh --dry-run           # print commands without running th
 
 The Kaggle upload (step 6) is opt-in via `--upload`. Training data generation is
 deliberately excluded -- it costs LLM budget and is offline work (see [Training](#training)).
+
+### Picking up new files
+
+Step 1 short-circuits once a scan has completed (`Scan already completed (N files)`).
+To look for SKILL.md files added since then:
+
+```bash
+scripts/build-dataset.sh --rescan
+```
+
+`--rescan` passes `--skip-cache` to `fetch-file-paths`, which bypasses *reads* of
+the GitHub API response cache (`~/.cache/github-data-file-fetcher/`) while still
+writing fresh responses back. Nothing is deleted, and fetched content in
+`data/content/` is untouched -- step 2 then downloads only the newly discovered
+files. Expect a full re-walk of the size range, which takes hours of API quota.
 
 The individual steps are documented below.
 
