@@ -169,6 +169,67 @@ class TestGenerateTrainingData:
             updated = f.read()
         assert updated.startswith(original.rstrip("\n"))
 
+    def test_writes_each_row_immediately(self, env):
+        """A run killed mid-flight must keep every already-completed label.
+
+        Call 1 succeeds, call 2 raises a BaseException (simulating a hard
+        crash; KeyboardInterrupt itself can't be used -- asyncio tears the
+        loop down before pending results are consumed). The first label must
+        already be on disk when the crash propagates.
+        """
+        from github_skills_dataset.filter.training import generate_training
+
+        class SimulatedCrash(BaseException):
+            pass
+
+        calls = [0]
+
+        async def fake_create(**kwargs):
+            calls[0] += 1
+            if calls[0] >= 2:
+                raise SimulatedCrash()
+            result = mock.MagicMock()
+            result.content = [mock.MagicMock(text='{"is_skill": true}')]
+            return result
+
+        client = mock.MagicMock()
+        client.messages.create = mock.AsyncMock(side_effect=fake_create)
+
+        with mock.patch("anthropic.AsyncAnthropic", return_value=client):
+            with pytest.raises(SimulatedCrash):
+                asyncio.run(generate_training(types.SimpleNamespace(
+                    main_db=env.main_db, output_db=env.output_db, content_dir=env.content_dir,
+                    labeled_csv=env.csv_path, model=None, base_url=None,
+                    concurrency=1, backend="anthropic", limit=None,
+                )))
+
+        # The completed label (call 1) must have been flushed before the crash
+        with open(env.csv_path) as f:
+            lines = [l for l in f if not l.startswith("#")]
+        rows = list(csv.DictReader(lines))
+        labeled = {r["content_hash"] for r in rows}
+        # 1 pre-existing + exactly 1 banked from the interrupted run
+        assert len(rows) == 2, "completed labels were lost on interrupt"
+        assert content_hash(SKILL_B) in labeled or content_hash(SKILL_C) in labeled
+
+    def test_every_run_stamps_provenance_header(self, env):
+        """Each run must append its own '# backend=, model=' line, even when
+        the CSV already exists -- otherwise mixed-model batches are unauditable."""
+        from github_skills_dataset.filter.training import generate_training
+        from github_skills_dataset.filter.config import DEFAULT_MODEL
+
+        client = _mock_anthropic_client()
+        with mock.patch("anthropic.AsyncAnthropic", return_value=client):
+            asyncio.run(generate_training(types.SimpleNamespace(
+                main_db=env.main_db, output_db=env.output_db, content_dir=env.content_dir,
+                labeled_csv=env.csv_path, model=None, base_url=None,
+                concurrency=1, backend="anthropic", limit=None,
+            )))
+
+        with open(env.csv_path) as f:
+            content = f.read()
+        assert f"# backend=anthropic, model={DEFAULT_MODEL}" in content
+
     def test_deduplicates_by_content_hash(self, env):
         """If multiple URLs have the same content, only one LLM call should be made."""
         from github_skills_dataset.filter.training import generate_training

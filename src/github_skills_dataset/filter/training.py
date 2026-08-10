@@ -184,31 +184,35 @@ async def generate_training(args):
         for ch, content in items
     ]
 
-    # Collect results
-    results = []
-    errors = 0
-    bar = tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="LLM classify", unit="file")
-    for coro in bar:
-        ch, is_skill, error = await coro
-        if error:
-            errors += 1
-            tqdm.write(f"Error: {error}")
-        else:
-            results.append((ch, is_skill))
-        bar.set_postfix(done=len(results), errors=errors)
-
-    print(f"\nClassified: {len(results):,}, Errors: {errors:,}")
-
-    # Append to CSV
+    # Append to CSV incrementally: one row per completed call, flushed
+    # immediately, so an interrupted run keeps every label it already paid
+    # for. Rerunning skips banked hashes via the CSV skip logic, making
+    # kill+rerun lose at most the in-flight calls.
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = csv_path.exists()
 
+    written = 0
+    errors = 0
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
+        # Every run stamps its provenance so mixed-model batches stay
+        # auditable (previously only the first-ever run wrote this).
+        f.write(f"# backend={backend}, model={model}\n")
         if not file_exists:
-            f.write(f"# backend={backend}, model={model}\n")
             writer.writerow(["content_hash", "is_skill"])
-        for ch, is_skill in results:
-            writer.writerow([ch, "true" if is_skill else "false"])
+        f.flush()
 
-    print(f"Appended {len(results):,} rows to {csv_path}")
+        bar = tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="LLM classify", unit="file")
+        for coro in bar:
+            ch, is_skill, error = await coro
+            if error:
+                errors += 1
+                tqdm.write(f"Error: {error}")
+            else:
+                writer.writerow([ch, "true" if is_skill else "false"])
+                f.flush()
+                written += 1
+            bar.set_postfix(done=written, errors=errors)
+
+    print(f"\nClassified: {written:,}, Errors: {errors:,}")
+    print(f"Appended {written:,} rows to {csv_path}")
