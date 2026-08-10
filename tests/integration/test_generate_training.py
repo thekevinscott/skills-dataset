@@ -169,6 +169,62 @@ class TestGenerateTrainingData:
             updated = f.read()
         assert updated.startswith(original.rstrip("\n"))
 
+    def test_labels_most_uncertain_first(self, env):
+        """With --limit, spend goes to files the classifier is least sure
+        about (confidence nearest 0.5), not scan order."""
+        from github_skills_dataset.filter.training import generate_training
+
+        # skill-b: classifier confident. skill-c: classifier unsure.
+        conn = sqlite3.connect(env.output_db)
+        conn.execute(
+            "UPDATE validation_results SET classifier_confidence = 0.99 WHERE url = ?",
+            (make_url("org", "repo-b"),))
+        conn.execute(
+            "UPDATE validation_results SET classifier_confidence = 0.52 WHERE url = ?",
+            (make_url("org", "repo-c"),))
+        conn.commit()
+        conn.close()
+
+        client = _mock_anthropic_client()
+        with mock.patch("anthropic.AsyncAnthropic", return_value=client):
+            asyncio.run(generate_training(types.SimpleNamespace(
+                main_db=env.main_db, output_db=env.output_db, content_dir=env.content_dir,
+                labeled_csv=env.csv_path, model=None, base_url=None,
+                concurrency=1, backend="anthropic", limit=1,
+            )))
+
+        assert client.messages.create.call_count == 1
+        prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        assert "skill-c" in prompt, "should label the uncertain file, not scan order"
+
+    def test_labels_unscored_before_scored(self, env):
+        """Files the classifier has never scored (fresh content) outrank
+        even the most uncertain scored files."""
+        from github_skills_dataset.filter.training import generate_training
+
+        # skill-b: unscored (NULL). skill-c: maximally uncertain.
+        conn = sqlite3.connect(env.output_db)
+        conn.execute(
+            "UPDATE validation_results SET classifier_confidence = NULL WHERE url = ?",
+            (make_url("org", "repo-b"),))
+        conn.execute(
+            "UPDATE validation_results SET classifier_confidence = 0.5 WHERE url = ?",
+            (make_url("org", "repo-c"),))
+        conn.commit()
+        conn.close()
+
+        client = _mock_anthropic_client()
+        with mock.patch("anthropic.AsyncAnthropic", return_value=client):
+            asyncio.run(generate_training(types.SimpleNamespace(
+                main_db=env.main_db, output_db=env.output_db, content_dir=env.content_dir,
+                labeled_csv=env.csv_path, model=None, base_url=None,
+                concurrency=1, backend="anthropic", limit=1,
+            )))
+
+        assert client.messages.create.call_count == 1
+        prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        assert "skill-b" in prompt, "unscored (new) content should be labeled first"
+
     def test_writes_each_row_immediately(self, env):
         """A run killed mid-flight must keep every already-completed label.
 

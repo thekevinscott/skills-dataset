@@ -67,17 +67,19 @@ async def generate_training(args):
     # Scan content directory
     _, to_validate, _ = scan_content(args)
 
-    # Get URLs with frontmatter
+    # Get URLs with frontmatter, plus the classifier's confidence per URL
+    # (NULL until pass 3 has scored it)
     conn = open_db(args.output_db)
-    has_fm = set(
-        row[0] for row in conn.execute(
-            "SELECT url FROM validation_results WHERE has_frontmatter = 1"
+    has_fm = {
+        row[0]: row[1] for row in conn.execute(
+            "SELECT url, classifier_confidence FROM validation_results WHERE has_frontmatter = 1"
         ).fetchall()
-    )
+    }
     conn.close()
 
     # Build content_hash -> content for unlabeled files, deduplicating
     to_label = {}  # content_hash -> content (truncated)
+    hash_conf = {}  # content_hash -> classifier_confidence of first-seen URL
     for url in to_validate:
         if url not in has_fm:
             continue
@@ -93,13 +95,25 @@ async def generate_training(args):
             continue
         content = local_path.read_text(errors='replace')
         to_label[ch] = content[:CONTENT_MAX_BYTES]
+        hash_conf[ch] = has_fm[url]
 
     print(f"Unlabeled unique content: {len(to_label):,}")
 
+    # Uncertainty sampling: unscored content (classifier has never seen it)
+    # first, then by distance from the 0.5 decision boundary. Each LLM label
+    # buys maximum classifier improvement instead of re-confirming easy calls.
+    def _priority(item):
+        conf = hash_conf.get(item[0])
+        if conf is None:
+            return (0, 0.0)
+        return (1, abs(conf - 0.5))
+
+    items = sorted(to_label.items(), key=_priority)
+    n_unscored = sum(1 for ch, _ in items if hash_conf.get(ch) is None)
+    print(f"Priority: {n_unscored:,} unscored first, then by classifier uncertainty")
+
     if limit is not None:
-        items = list(to_label.items())[:limit]
-    else:
-        items = list(to_label.items())
+        items = items[:limit]
 
     print(f"To classify: {len(items):,}")
 
