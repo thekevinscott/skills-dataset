@@ -21,3 +21,5 @@ SKILL.md classifier pipeline for building a Kaggle dataset. See README.md for fu
 - **DB skip logic**: Only pass 1 uses the DB for skipping (frontmatter check). Everything else either re-runs (pass 2-3) or uses CSV (training generator).
 - **Red-green TDD**: Write failing test first, then fix code. Never edit tests and production code simultaneously.
 - **Commit and push**: After making a change, commit and push.
+
+@docs/internals/session-handoff.md
